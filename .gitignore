@@ -24,3 +24,6 @@ __pycache__/
 .idea/
 Thumbs.db
 desktop.ini
+
+# ===== 本地备忘录（内部开发过程，不对外）=====
+开发记录-本地备忘.md
