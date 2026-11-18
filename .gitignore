@@ -1,0 +1,26 @@
+# ===== 运行时与本地环境文件（首次运行会自动生成，不要纳入版本库）=====
+mcp-relay.config.json
+mcp-relay.config.json.bak
+mcp-relay.config.json.tmp
+mcp-relay.log
+mcp-relay.pid
+xmcp-console.log
+xmcp-console-status.txt
+firewall-state.txt
+firewall-fingerprint.txt
+firewall-once/
+relay-test*.log
+
+# ===== 快捷方式（含绝对路径，换机器必然失效，由程序自动重建）=====
+*.lnk
+*.lnk.old
+
+# ===== Python =====
+__pycache__/
+*.pyc
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

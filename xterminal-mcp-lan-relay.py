@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MCP / HTTP 局域网反代（配置驱动，可挂多个代理）
+------------------------------------------------------------
+配置文件：mcp-relay.config.json（与本脚本同目录，或由环境变量
+         XT_MCP_RELAY_CONFIG 指定）。
+每条 proxy = 一组"对外监听地址:端口 → 上游地址:端口"，互相独立，
+可以按需增加任意多个。
+
+为什么需要这个反代（针对 XTerminal MCP）：
+  XTerminal 的 MCP 服务只监听 127.0.0.1，且用 SDK 的
+  localhostHostValidation 只接受 Host 为 127.0.0.1 / localhost / ::1，
+  其它 Host 一律 403 Invalid Host。因此单纯的端口映射
+  （netsh portproxy、路由器端口转发）都会失败，必须改写 Host。
+
+所以配置里的 rewrite_host: true 表示"把 Host 头改写成上游地址"，
+这是 XTerminal 这类本机服务必需的行为；普通 HTTP 服务可设为 false。
+
+只依赖标准库，支持 SSE / Streamable HTTP 流式响应（chunked 透传）。
+
+用法：
+    C:\\Python314\\pythonw.exe xterminal-mcp-lan-relay.py
+环境变量：
+    XT_MCP_RELAY_CONFIG   指定配置文件路径（默认同目录 mcp-relay.config.json）
+"""
+
+import http.client
+import http.server
+import json
+import os
+import socket
+import socketserver
+import sys
+import threading
+import time
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.environ.get("XT_MCP_RELAY_CONFIG") or os.path.join(
+    SCRIPT_DIR, "mcp-relay.config.json"
+)
+
+
+def strip_comments(text):
+    """配置里允许 # 到行尾的注释；字符串内部的 # 不处理。换行保留，行号不变。"""
+    out = []
+    i = 0
+    n = len(text)
+    in_str = False
+    esc = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def drop_trailing_commas(text):
+    """去掉 ] 或 } 前面多余的逗号（注释剥掉后常会留下这种尾巴）。"""
+    out = []
+    i = 0
+    n = len(text)
+    in_str = False
+    esc = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "]}":
+                i += 1
+                continue
+            out.append(c)
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def sanitize(text):
+    return drop_trailing_commas(strip_comments(text))
+
+# 逐跳头，转发时丢弃
+HOP_BY_HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+
+# 没有配置文件时的兜底：保持老行为，只服务 XTerminal MCP
+DEFAULT_CONFIG = {
+    "proxies": [
+        {
+            "name": "xterminal-mcp",
+            "enabled": True,
+            "listen": [
+                h.strip() + ":" + os.environ.get("XT_MCP_RELAY_PORT", "12335")
+                for h in os.environ.get("XT_MCP_RELAY_LISTEN", "192.168.110.1,192.168.1.20").split(",")
+                if h.strip()
+            ],
+            "target": "127.0.0.1:" + os.environ.get("XT_MCP_TARGET_PORT", "12335"),
+            "rewrite_host": True,
+            "upstream_timeout": 3600,
+        }
+    ]
+}
+
+_LOG_PATH = os.path.join(SCRIPT_DIR, "mcp-relay.log")
+_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
+def log(msg):
+    line = "%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    # 1) 有控制台时同时打到控制台
+    try:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    except Exception:
+        pass
+    # 2) 始终写日志文件（pythonw 启动时没有控制台，只能靠这里留痕）
+    try:
+        if os.path.exists(_LOG_PATH) and os.path.getsize(_LOG_PATH) > _LOG_MAX_BYTES:
+            os.replace(_LOG_PATH, _LOG_PATH + ".1")
+        with open(_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
+
+def parse_addr(text, field):
+    """把 'host:port' 解析成 (host, port)。"""
+    if not isinstance(text, str) or ":" not in text:
+        raise ValueError("%s 必须是 '地址:端口' 形式，收到: %r" % (field, text))
+    host, _, port_text = text.rpartition(":")
+    if not host:
+        raise ValueError("%s 缺少地址部分: %r" % (field, text))
+    try:
+        port = int(port_text)
+    except ValueError:
+        raise ValueError("%s 端口不是整数: %r" % (field, text))
+    if not (1 <= port <= 65535):
+        raise ValueError("%s 端口超出范围 1-65535: %r" % (field, text))
+    return host, port
+
+
+def load_config():
+    """读配置并做校验，返回 (proxies, log_settings)。出错抛 ValueError。"""
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as fh:
+                raw = json.loads(sanitize(fh.read()))
+        except json.JSONDecodeError as exc:
+            raise ValueError("配置文件不是合法 JSON: %s (%s)" % (CONFIG_PATH, exc))
+        src = CONFIG_PATH
+    else:
+        raw = DEFAULT_CONFIG
+        src = "内置默认值（未找到 %s）" % CONFIG_PATH
+
+    log_settings = raw.get("log") or {}
+    proxies_raw = raw.get("proxies")
+    if not isinstance(proxies_raw, list) or not proxies_raw:
+        raise ValueError("配置里 proxies 必须是非空数组: %s" % src)
+
+    proxies = []
+    for idx, item in enumerate(proxies_raw, 1):
+        if not isinstance(item, dict):
+            raise ValueError("proxies[%d] 必须是对象" % idx)
+        name = str(item.get("name") or "proxy-%d" % idx)
+        if not item.get("enabled", True):
+            log("SKIP  %s  (enabled=false)" % name)
+            continue
+
+        listen_raw = item.get("listen")
+        if isinstance(listen_raw, str):
+            listen_raw = [listen_raw]
+        if not isinstance(listen_raw, list) or not listen_raw:
+            raise ValueError("%s: listen 必须是非空数组或字符串" % name)
+
+        listens = []
+        for entry in listen_raw:
+            listens.append(parse_addr(entry, "%s.listen" % name))
+
+        target = parse_addr(item.get("target"), "%s.target" % name)
+
+        rewrite = bool(item.get("rewrite_host", True))
+        host_header = item.get("host_header")
+        if host_header and not rewrite:
+            raise ValueError("%s: 给了 host_header 但 rewrite_host=false，语义冲突" % name)
+        if rewrite and not host_header:
+            host_header = "%s:%d" % target
+
+        timeout = item.get("upstream_timeout", 3600)
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            raise ValueError("%s: upstream_timeout 必须是数字" % name)
+
+        proxies.append(
+            {
+                "name": name,
+                "listen": listens,
+                "target": target,
+                "rewrite_host": rewrite,
+                "host_header": host_header,
+                "timeout": timeout,
+            }
+        )
+
+    if not proxies:
+        raise ValueError("所有 proxy 都是 enabled=false，没有可启动的代理")
+
+    return proxies, log_settings, src
+
+
+class RelayHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "XTMCPRelay/2.0"
+    sys_version = ""
+    PROXY = None  # 由 make_handler 注入
+
+    # BaseHTTPRequestHandler 默认按 HTTP/1.0 关连接语义写日志，这里统一简化
+    def log_message(self, fmt, *args):
+        log("[%s:%s] %s" % (self.PROXY["name"], self.address_string(), fmt % args))
+
+    def _read_chunked_body(self):
+        """读取客户端发来的 chunked 请求体并还原为完整 bytes（MCP 请求体很小）。"""
+        buf = bytearray()
+        while True:
+            line = self.rfile.readline(65536).strip()
+            if not line:
+                break
+            size = int(line.split(b";")[0], 16)
+            if size == 0:
+                self.rfile.readline(65536)  # 吃掉结尾的空行
+                break
+            buf += self.rfile.read(size)
+            self.rfile.read(2)  # CRLF
+        return bytes(buf)
+
+    def _relay(self):
+        cfg = self.PROXY
+        method = self.command
+        path = self.path
+
+        # ---- 1. 读客户端请求体 ----
+        body = None
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            body = self._read_chunked_body()
+            declared_length = len(body)
+        else:
+            raw_len = self.headers.get("Content-Length")
+            if raw_len:
+                declared_length = int(raw_len)
+                body = self.rfile.read(declared_length)
+            else:
+                declared_length = 0
+
+        # ---- 2. 构造上游请求头（关键：Host 改写）----
+        headers = {}
+        for key, value in self.headers.items():
+            lower = key.lower()
+            if lower in HOP_BY_HOP or lower == "host" or lower == "content-length":
+                continue
+            headers[key] = value
+        if cfg["rewrite_host"]:
+            headers["Host"] = cfg["host_header"]
+        headers["Connection"] = "close"   # 让上游在响应结束后关连接，便于判断流结尾
+        if body is not None:
+            headers["Content-Length"] = str(len(body))
+
+        # ---- 3. 请求上游 ----
+        target_host, target_port = cfg["target"]
+        conn = http.client.HTTPConnection(target_host, target_port, timeout=cfg["timeout"])
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            response = conn.getresponse()
+        except Exception as exc:  # noqa: BLE001
+            log("UPSTREAM FAIL [%s] %s %s -> %s" % (cfg["name"], method, path, exc))
+            payload = ('{"jsonrpc":"2.0","error":{"code":-32099,'
+                       '"message":"relay upstream unavailable: %s"},"id":null}' % exc).encode("utf-8")
+            self.send_response_only(502, "Bad Gateway")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(payload)
+                self.wfile.flush()
+            except Exception:
+                pass
+            conn.close()
+            self.close_connection = True
+            return
+
+        # ---- 4. 回写状态行与响应头 ----
+        self.send_response_only(response.status, response.reason)
+        upstream_length = response.length  # chunked 或 close-delimited 时为 None
+        for key, value in response.getheaders():
+            if key.lower() in HOP_BY_HOP or key.lower() == "content-length":
+                continue
+            self.send_header(key, value)
+        if upstream_length is not None:
+            self.send_header("Content-Length", str(upstream_length))
+        else:
+            self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        # ---- 5. 透传响应体（支持 SSE 流式）----
+        chunked_to_client = upstream_length is None
+        try:
+            if method == "HEAD" or response.status in (204, 304):
+                pass
+            elif chunked_to_client:
+                while True:
+                    data = response.read(4096)
+                    if not data:
+                        break
+                    self.wfile.write(b"%x\r\n" % len(data))
+                    self.wfile.write(data)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            else:
+                remaining = upstream_length
+                while remaining > 0:
+                    data = response.read(min(65536, remaining))
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    self.wfile.write(data)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, socket.timeout) as exc:
+            log("CLIENT DROP [%s] %s %s -> %s" % (cfg["name"], method, path, exc))
+        except Exception as exc:  # noqa: BLE001
+            log("RELAY BODY ERROR [%s] %s %s -> %s" % (cfg["name"], method, path, exc))
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+            conn.close()
+
+    # 所有方法统一走 _relay（MCP 用到 POST / GET / DELETE / OPTIONS）
+    do_GET = _relay
+    do_POST = _relay
+    do_DELETE = _relay
+    do_PUT = _relay
+    do_PATCH = _relay
+    do_HEAD = _relay
+    do_OPTIONS = _relay
+
+
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def make_handler(proxy_cfg):
+    return type("RelayHandler_%s" % str(proxy_cfg["name"]).replace("-", "_"),
+                (RelayHandler,), {"PROXY": proxy_cfg})
+
+
+def main():
+    global _LOG_PATH, _LOG_MAX_BYTES
+
+    try:
+        proxies, log_settings, src = load_config()
+    except ValueError as exc:
+        log("FATAL: 配置错误 -> %s" % exc)
+        return 3
+
+    log_file = log_settings.get("file")
+    if log_file:
+        _LOG_PATH = log_file if os.path.isabs(log_file) else os.path.join(SCRIPT_DIR, log_file)
+    try:
+        _LOG_MAX_BYTES = int(log_settings.get("max_bytes") or _LOG_MAX_BYTES)
+    except (TypeError, ValueError):
+        pass
+
+    log("=" * 60)
+    log("配置文件: %s" % src)
+
+    servers = []
+    for proxy in proxies:
+        for host, port in proxy["listen"]:
+            try:
+                srv = ThreadingHTTPServer((host, port), make_handler(proxy))
+            except OSError as exc:
+                log("FATAL: 无法监听 %s:%d (%s) -> %s" % (host, port, proxy["name"], exc))
+                log("       端口被占用？先把占用它的程序停掉，或改配置里的 listen")
+                for s in servers:
+                    s.server_close()
+                return 2
+            servers.append((proxy, srv, host, port))
+            log("LISTEN %-16s http://%s:%d  ->  http://%s:%d%s" % (
+                "[" + proxy["name"] + "]",
+                host, port,
+                proxy["target"][0], proxy["target"][1],
+                ("  (Host 改写为 " + proxy["host_header"] + ")") if proxy["rewrite_host"] else "",
+            ))
+
+    if not servers:
+        log("FATAL: 没有任何监听起来")
+        return 4
+
+    for _, srv, _, _ in servers:
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+
+    log("relay ready: %d 个代理 / %d 个监听地址" % (len(proxies), len(servers)))
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        log("收到中断，退出")
+    finally:
+        for _, srv, _, _ in servers:
+            try:
+                srv.shutdown()
+                srv.server_close()
+            except Exception:
+                pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

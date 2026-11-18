@@ -1,0 +1,35 @@
+{
+  "_说明": "配置样例。复制成 mcp-relay.config.json 后按自己环境改；也可以什么都不做，控制台首次运行会自动生成一份适配本机网卡的配置。每条 proxy = 一组「对外监听 listen → 上游 target」。listen 可写多个地址；改完重启代理即生效，防火墙规则由启动脚本按本文件自动同步。支持 # 注释（从 # 到行尾整段忽略）。",
+  "log": {
+    "file": "mcp-relay.log",
+    "max_bytes": 5242880
+  },
+  "firewall": {
+    "enabled": true,
+    "local_address": "192.168.1.10",
+    "remote_address": "192.168.1.0/24",
+    "_说明": "启动时自动比对：为每个监听在该网卡地址上的端口建放行规则，其余端口用端口段黑名单封掉（有差异才弹一次 UAC）。"
+  },
+  "proxies": [
+    {
+      "name": "xterminal-mcp",
+      "enabled": true,
+      "listen": [
+        "192.168.1.10:12335"
+      ],
+      "target": "127.0.0.1:12335",
+      "rewrite_host": true,
+      "upstream_timeout": 3600
+    },
+    {
+      "name": "示例-第二个服务",
+      "enabled": false,
+      "listen": [
+        "192.168.1.10:8088"
+      ],
+      "target": "127.0.0.1:8080",
+      "rewrite_host": false,
+      "upstream_timeout": 60
+    }
+  ]
+}
