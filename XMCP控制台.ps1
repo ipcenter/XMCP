@@ -20,6 +20,12 @@ $stopPs1  = Join-Path $root 'stop-mcp-relay.ps1'
 $uiLog    = Join-Path $root 'xmcp-console.log'
 $uiSnap   = Join-Path $root 'xmcp-console-status.txt'
 $pywExe   = 'C:\Python314\pythonw.exe'
+if (-not (Test-Path -LiteralPath $pywExe)) {
+    # 换机器时别写死路径：先去 PATH 找 pythonw，再退 python
+    try { $pywExe = (Get-Command pythonw.exe -ErrorAction Stop).Source } catch {
+        try { $pywExe = (Get-Command python.exe -ErrorAction Stop).Source } catch { $pywExe = '' }
+    }
+}
 # 系统工具一律走绝对路径：控制台若从精简 PATH 的宿主拉起来（例如被别的自动化程序
 # Start-Process），PATH 里没有 System32，裸写 curl.exe / netstat / powershell.exe 会直接
 # 报“不是命令”，连通性检查会误报 0/2 不通。
@@ -1499,7 +1505,7 @@ XMCP 反代工具
 问题反馈    联系微信 xywaykie
 
 适用系统    Windows 10 / 11（64 位）
-运行依赖    Windows PowerShell 5.1 + Python 3（本机 C:\Python314\pythonw.exe）
+运行依赖    Windows PowerShell 5.1 + Python 3（自动探测：常见安装目录或系统 PATH 均可）
 安装方式    绿色版、免安装：解压即用，整个目录可随意拷贝，不写注册表、不改系统设置
 
 界面技术    PowerShell + WinForms，单窗口六页：状态 / 配置格式 / 配置内容 / 运行日志 / 使用说明 / 关于软件

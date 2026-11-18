@@ -1,6 +1,6 @@
 ﻿# XMCP 局域网反代（虚拟机 → 宿主机 XTerminal MCP）
 
-目录：`E:\XY项目代码库\XMCP`
+目录：本程序所在目录（绿色版，放哪个盘哪个路径都行；脚本全部用 $PSScriptRoot 定位，不写死绝对路径）
 版本：配置驱动版（2026-11-17）。监听地址、上游地址、防火墙放行端口都来自 `mcp-relay.config.json`，加代理只改这一个文件。
 
 ## 一、这套东西干什么
@@ -173,10 +173,10 @@ XTerminal 的 MCP 服务有两个硬限制，导致虚拟机不能直连：
 命令行等价写法（不想用窗口时）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "E:\XY项目代码库\XMCP\start-mcp-relay.ps1"
-powershell -ExecutionPolicy Bypass -File "E:\XY项目代码库\XMCP\stop-mcp-relay.ps1"
-powershell -ExecutionPolicy Bypass -File "E:\XY项目代码库\XMCP\check-mcp-relay.ps1"
-powershell -ExecutionPolicy Bypass -File "E:\XY项目代码库\XMCP\XMCP控制台.ps1" -AutoTray   # 检测完直接缩托盘，不弹窗口
+powershell -ExecutionPolicy Bypass -File ".\start-mcp-relay.ps1"        # 先 cd 到程序目录
+powershell -ExecutionPolicy Bypass -File ".\stop-mcp-relay.ps1"
+powershell -ExecutionPolicy Bypass -File ".\check-mcp-relay.ps1"
+powershell -ExecutionPolicy Bypass -File ".\XMCP控制台.ps1" -AutoTray   # 检测完直接缩托盘，不弹窗口
 ```
 
 正常时应看到三条监听：
@@ -664,9 +664,9 @@ check-mcp-relay.ps1，输出配置路径为 D:\_xmcp_portable_test\mcp-relay.con
 唯一不会自动跟随的是 .lnk（快捷方式里存的是绝对路径），用 重建快捷方式.bat 重生成即可。
 【重要】换目录后「配置路径没变」的真正原因（2026-11-18 实测）
   现象：目录已拷到 D:\Program Files (x86)\XMCP，双击里面的「XMCP 反代工具.lnk」，
-        状态页 [配置] 仍显示 E:\XY项目代码库\XMCP\mcp-relay.config.json。
+        状态页 [配置] 仍显示老目录的 mcp-relay.config.json。
   原因：副本里的 .lnk 是从老目录原样带过来的，而快捷方式内部存的是绝对路径
-        （Target / WorkingDirectory / Icon 全是 E:\...），双击它等于启动老目录那份控制台；
+        （Target / WorkingDirectory / Icon 全是老目录的绝对路径），双击它等于启动老目录那份控制台；
         程序自身的路径推导没问题（都是 $PSScriptRoot），是入口指错了。
   已加的自救：控制台启动时调用 Repair-Shortcut —— 检查同目录「XMCP 反代工具.lnk」，
         Target 不等于当前目录的 XMCP控制台.bat 就按当前目录重写（日志记
@@ -677,7 +677,7 @@ check-mcp-relay.ps1，输出配置路径为 D:\_xmcp_portable_test\mcp-relay.con
         双击新副本会弹「控制台已经在运行」，此时看到的是老窗口，不是路径没变。
 【结构性修复 · 2026-11-18 18:15】换盘后「[配置] 还是老路径」的根因彻底消除
   根因：.lnk 只能存绝对路径。把整个程序目录拷贝到 D:\...、F:\... 时，目录里的
-        「XMCP 反代工具.lnk」一起被带走，而它 Target 仍写着 E:\XY项目代码库\XMCP\...\bat，
+        「XMCP 反代工具.lnk」一起被带走，而它 Target 仍写着老目录的 ...\XMCP控制台.bat，
         双击它就等于启动 E 盘那份控制台 —— 程序自身路径推导没错，错的是入口。
   改法（三处，一次性解决，不再依赖记得手动重建）：
     1. 程序目录里不再放任何 .lnk（已从 E / D / F 三处删除），杜绝它跟着复制走样；
