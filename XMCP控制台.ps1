@@ -2127,10 +2127,10 @@ $tabProbe.Padding = New-Object Windows.Forms.Padding(3)
 $script:tabProbe = $tabProbe
 
 $lblProbeHint = New-Object Windows.Forms.Label
-$lblProbeHint.Text = "填上游 MCP 地址（一般是 http(s)://127.0.0.1:端口/mcp），点「开始探测」：探针分别按旧规范发 initialize、按新规范发 server/discover，看上游认哪一套，据此判断协议代际。令牌可选，上游要 Bearer 时再填。"
+$lblProbeHint.Text = "填上游 MCP 地址（一般是 http(s)://127.0.0.1:端口/mcp），点「开始探测」：探针分别按旧规范发 initialize、按新规范发 server/discover，看上游认哪一套。上游要登录时在下方令牌框填 API Key，探针只发 Authorization: Bearer 头，内容打码、不写日志。"
 $lblProbeHint.AutoSize = $false
 $lblProbeHint.TextAlign = [Drawing.ContentAlignment]::TopLeft
-$panelProbeHint = New-HintPanel $lblProbeHint 54
+$panelProbeHint = New-HintPanel $lblProbeHint 64
 $tabProbe.Controls.Add($panelProbeHint)
 $script:panelProbeHint = $panelProbeHint
 
@@ -2145,7 +2145,7 @@ $tabProbe.Controls.Add($txtProbeUrl)
 $script:txtProbeUrl = $txtProbeUrl
 
 $lblProbeToken = New-Object Windows.Forms.Label
-$lblProbeToken.Text = '令牌:'
+$lblProbeToken.Text = '令牌(Bearer):'
 $tabProbe.Controls.Add($lblProbeToken)
 $script:lblProbeToken = $lblProbeToken
 
@@ -2604,21 +2604,21 @@ function Update-Layout {
         $btnLogRefresh.Location = New-Object Drawing.Point(6, ($ph - 32))
         $btnLogOpen.Location = New-Object Drawing.Point(108, ($ph - 32))
         $btnLogOpenUi.Location = New-Object Drawing.Point(274, ($ph - 32))
-        # MCP 版本探针页（说明框 + 地址/令牌一行 + 探测按钮 + 结果框）
+        # MCP 版本探针页（说明框 + 地址一行 + 令牌一行 + 探测按钮 + 结果框）
         $script:panelProbeHint.Location = New-Object Drawing.Point(6, 4)
-        $script:panelProbeHint.Size = New-Object Drawing.Size(($pw - 12), 54)
-        $script:lblProbeUrl.Location = New-Object Drawing.Point(6, 64)
+        $script:panelProbeHint.Size = New-Object Drawing.Size(($pw - 12), 64)
+        $script:lblProbeUrl.Location = New-Object Drawing.Point(6, 78)
         $script:lblProbeUrl.Size = New-Object Drawing.Size(64, 22)
-        $script:txtProbeUrl.Location = New-Object Drawing.Point(74, 62)
-        $script:txtProbeUrl.Size = New-Object Drawing.Size(($pw - 180), 22)
-        $script:lblProbeToken.Location = New-Object Drawing.Point(($pw - 170), 64)
-        $script:lblProbeToken.Size = New-Object Drawing.Size(64, 22)
-        $script:txtProbeToken.Location = New-Object Drawing.Point(($pw - 104), 62)
-        $script:txtProbeToken.Size = New-Object Drawing.Size(98, 22)
-        $btnProbe.Location = New-Object Drawing.Point(6, 92)
+        $script:txtProbeUrl.Location = New-Object Drawing.Point(74, 76)
+        $script:txtProbeUrl.Size = New-Object Drawing.Size(($pw - 80), 22)
+        $script:lblProbeToken.Location = New-Object Drawing.Point(6, 106)
+        $script:lblProbeToken.Size = New-Object Drawing.Size(100, 22)
+        $script:txtProbeToken.Location = New-Object Drawing.Point(106, 104)
+        $script:txtProbeToken.Size = New-Object Drawing.Size(($pw - 112), 22)
+        $btnProbe.Location = New-Object Drawing.Point(6, 134)
         $btnProbe.Size = New-Object Drawing.Size(96, 26)
-        $script:txtProbeResult.Location = New-Object Drawing.Point(6, 126)
-        $script:txtProbeResult.Size = New-Object Drawing.Size(($pw - 12), ($ph - 126))
+        $script:txtProbeResult.Location = New-Object Drawing.Point(6, 166)
+        $script:txtProbeResult.Size = New-Object Drawing.Size(($pw - 12), ($ph - 166))
         # 使用说明页 / 关于软件页：整页一个带边框的阅读框
         $script:panelHelp.Location = New-Object Drawing.Point(6, 6)
         $script:panelHelp.Size = New-Object Drawing.Size(($pw - 12), ($ph - 12))
