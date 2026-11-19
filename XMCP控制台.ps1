@@ -97,7 +97,7 @@ $script:singleton   = $null
 $script:bgPs        = $null
 $script:bgHandle    = $null
 $script:taskTimer   = $null
-# MCP 版本探针的后台任务（与反代启停互不干扰）
+# MCP 探针的后台任务（与反代启停互不干扰）
 $script:probePs     = $null
 $script:probeHandle = $null
 $script:probeTimer  = $null
@@ -545,7 +545,7 @@ function Start-RelayTask {
     $script:taskTimer.Start()
 }
 
-# ===== MCP 版本探针 =====
+# ===== MCP 探针 =====
 # 后台任务：旧规范 initialize（有状态握手）、新规范 server/discover（无状态）各打一发，
 # 有会话号再探 GET 通知流与 DELETE 会话；只做探测、不改报文，解析和结论判定放回 UI 线程。
 $script:probeTaskCode = @'
@@ -716,6 +716,7 @@ function Get-DefaultProbeUrl {
 function Set-ProbeResult {
     param([string]$Text)
     $script:txtProbeResult.Text = $Text
+    Set-TextInnerPad $script:txtProbeResult
 }
 
 # 三态：yes=✓ 绿 / no=✗ 红 / unknown=? 灰 / na=– 灰
@@ -833,6 +834,9 @@ function Render-ProbeResult {
         }
     }
     Add-Line $concl $conclColor
+    # 渲染完再套一次内边距：Update-Layout 阶段句柄可能还没创建，EM_SETRECT 会被跳过；
+    # 此时窗口已显示、句柄存在，确保文字四周和状态页一样留白。
+    Set-TextInnerPad $rt
 }
 
 function Start-Probe {
@@ -2122,9 +2126,9 @@ $script:txtLogRelay = $txtLogRelay
 $tabLog.Controls.Add($logTabs)
 $script:logTabs = $logTabs
 
-# --- tab 5：MCP 版本探针 ---
+# --- tab 5：MCP 探针 ---
 $tabProbe = New-Object Windows.Forms.TabPage
-$tabProbe.Text = 'MCP版本探针'
+$tabProbe.Text = 'MCP探针'
 $tabProbe.Padding = New-Object Windows.Forms.Padding(3)
 [void]$tabs.Controls.Add($tabProbe)
 $script:tabProbe = $tabProbe
@@ -2252,7 +2256,7 @@ XMCP 局域网反代工具 · 使用说明
      "rewrite_host": false, "upstream_timeout": 60
    点「重启代理」——先校验格式，通过才写盘（旧文件备份 .bak）并重启；
    随后在状态页 [监听] 确认新端口已 LISTENING，[连通性] 显示「连通」。
-4. 「MCP版本探针」页：填上游地址点「开始探测」。探针分别按旧规范 initialize、
+4. 「MCP探针」页：填上游地址点「开始探测」。探针分别按旧规范 initialize、
    新规范 server/discover 各打一发，有会话号再探通知流与会话删除，输出兼容性报告：
    两条协议腿是否支持、会话能力（会话号 / GET 流 / DELETE 会话）、服务端能力
    （Tools / Resources / Prompts），结论分双协议 / 仅旧 / 仅新 / 需要令牌 / 连不上。
@@ -2416,7 +2420,7 @@ $btnSelCopy.add_Click({
             '状态'     { $box = $script:txtStatus }
             '配置格式' { $box = $txtSample }
             '配置内容' { $box = $script:txtCfg }
-            'MCP版本探针' { $box = $script:txtProbeResult }
+            'MCP探针' { $box = $script:txtProbeResult }
             '使用说明' { $box = $script:txtHelp }
             '关于软件' { $box = $script:txtAbout }
             '运行日志' {
@@ -2609,7 +2613,7 @@ function Update-Layout {
         $btnLogRefresh.Location = New-Object Drawing.Point(6, ($ph - 32))
         $btnLogOpen.Location = New-Object Drawing.Point(108, ($ph - 32))
         $btnLogOpenUi.Location = New-Object Drawing.Point(274, ($ph - 32))
-        # MCP 版本探针页（说明框 + 地址一行 + 令牌一行 + 探测按钮 + 结果框）
+        # MCP 探针页（说明框 + 地址一行 + 令牌/按钮一行 + 结果框）
         $script:panelProbeHint.Location = New-Object Drawing.Point(6, 4)
         $script:panelProbeHint.Size = New-Object Drawing.Size(($pw - 12), 64)
         $script:lblProbeUrl.Location = New-Object Drawing.Point(6, 78)
@@ -2618,12 +2622,12 @@ function Update-Layout {
         $script:txtProbeUrl.Size = New-Object Drawing.Size(($pw - 80), 22)
         $script:lblProbeToken.Location = New-Object Drawing.Point(6, 106)
         $script:lblProbeToken.Size = New-Object Drawing.Size(100, 22)
-        $script:txtProbeToken.Location = New-Object Drawing.Point(106, 104)
-        $script:txtProbeToken.Size = New-Object Drawing.Size(($pw - 112), 22)
-        $btnProbe.Location = New-Object Drawing.Point(6, 134)
+        $btnProbe.Location = New-Object Drawing.Point(($pw - 6 - 96), 102)
         $btnProbe.Size = New-Object Drawing.Size(96, 26)
-        $script:txtProbeResult.Location = New-Object Drawing.Point(6, 166)
-        $script:txtProbeResult.Size = New-Object Drawing.Size(($pw - 12), ($ph - 166))
+        $script:txtProbeToken.Location = New-Object Drawing.Point(106, 104)
+        $script:txtProbeToken.Size = New-Object Drawing.Size(($pw - 216), 22)
+        $script:txtProbeResult.Location = New-Object Drawing.Point(6, 134)
+        $script:txtProbeResult.Size = New-Object Drawing.Size(($pw - 12), ($ph - 134))
         Set-TextInnerPad $script:txtProbeResult
         # 使用说明页 / 关于软件页：整页一个带边框的阅读框
         $script:panelHelp.Location = New-Object Drawing.Point(6, 6)
