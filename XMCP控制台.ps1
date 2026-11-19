@@ -97,6 +97,10 @@ $script:singleton   = $null
 $script:bgPs        = $null
 $script:bgHandle    = $null
 $script:taskTimer   = $null
+# MCP 版本探针的后台任务（与反代启停互不干扰）
+$script:probePs     = $null
+$script:probeHandle = $null
+$script:probeTimer  = $null
 $script:relayTaskMode = 'Start'
 $script:autoTrayPending = $false
 $script:configDirty = $false
@@ -541,6 +545,219 @@ function Start-RelayTask {
     $script:taskTimer.Start()
 }
 
+# ===== MCP 版本探针 =====
+# 后台任务：分别按旧规范 initialize、新规范 server/discover 各打一发，带回响应头与正文。
+# 只做探测、不改报文；解析和结论判定放回 UI 线程做。
+$script:probeTaskCode = @'
+param($Url, $Token)
+$curl = Join-Path $env:SystemRoot 'System32\curl.exe'
+if (-not (Test-Path -LiteralPath $curl)) { $curl = 'curl.exe' }
+
+function Invoke-McpPost {
+    param($Url, $Token, $Method, $Version, $Params, $Meta)
+    $headers = @('-H', 'Content-Type: application/json', '-H', 'Accept: application/json, text/event-stream')
+    if ($Token)  { $headers += @('-H', ('Authorization: Bearer ' + $Token)) }
+    if ($Version) { $headers += @('-H', ('MCP-Protocol-Version: ' + $Version)) }
+    $bodyObj = [ordered]@{ jsonrpc = '2.0'; id = 1; method = $Method; params = $Params }
+    if ($Meta) { $bodyObj['_meta'] = $Meta }
+    $body = ($bodyObj | ConvertTo-Json -Compress -Depth 6)
+    # -i 带回响应头；-k 忽略自签证书（探针只做诊断，和反代侧 CERT_NONE 一致）；--noproxy 不走系统代理；--max-time 5 防止卡死 UI 等待
+    $raw = & $curl -sS -k -i --noproxy '*' --max-time 5 -X POST $Url @headers -d $body 2>&1 | Out-String
+    return $raw
+}
+
+function Split-Response {
+    param($Raw)
+    $code = '000'; $session = ''; $body = ''
+    if (-not $Raw) { return @{ Code = $code; Session = ''; Body = '' } }
+    $parts = $Raw -split "`r?`n`r?`n", 2
+    $head = $parts[0]
+    if ($parts.Count -gt 1) { $body = $parts[1] }
+    $m = [regex]::Match($head, 'HTTP/\S+\s+(\d+)')
+    if ($m.Success) { $code = $m.Groups[1].Value }
+    $sm = [regex]::Match($head, '(?im)^\s*mcp-session-id:\s*(\S+)')
+    if ($sm.Success) { $session = $sm.Groups[1].Value }
+    # 响应可能是 SSE 帧（event: message / data: {...}），把 data: 行拼回 JSON
+    if ($body -match 'event:') {
+        $jsonLines = @()
+        foreach ($ln in ($body -split "`r?`n")) {
+            if ($ln -match '^\s*data:\s?(.*)$') { $jsonLines += $Matches[1] }
+        }
+        $body = ($jsonLines -join '')
+    }
+    return @{ Code = $code; Session = $session; Body = $body.Trim() }
+}
+
+# 规范化 URL：没写协议补 http://；只有主机端口时补 /mcp
+$u = ($Url.Trim())
+if ($u -notmatch '^\w+://') { $u = 'http://' + $u }
+if ($u -match '^(\w+://[^/]+)/?$') { $u = $Matches[1] + '/mcp' }
+
+$initParams = @{
+    protocolVersion = '2025-11-25'
+    capabilities    = @{}
+    clientInfo      = @{ name = 'xmcp-probe'; version = '1.0' }
+}
+$meta = @{ 'io.modelcontextprotocol' = @{ protocolVersion = '2026-07-28' } }
+
+$initRaw = Invoke-McpPost -Url $u -Token $Token -Method 'initialize'    -Version '2025-11-25' -Params $initParams
+$discRaw = Invoke-McpPost -Url $u -Token $Token -Method 'server/discover' -Version '2026-07-28' -Params @{} -Meta $meta
+
+$init = Split-Response $initRaw
+$disc = Split-Response $discRaw
+
+$out = @()
+$out += ('URL=' + $u)
+$out += ('INIT_HTTP=' + $init.Code)
+$out += ('INIT_SESSION=' + $init.Session)
+$out += ('INIT_BODY=' + $init.Body)
+$out += ('DISC_HTTP=' + $disc.Code)
+$out += ('DISC_BODY=' + $disc.Body)
+$out -join "`n"
+'@
+
+function Parse-ProbeBody {
+    # 从单条 JSON-RPC 响应里抠出版本 / 服务端信息 / 错误码；抠不出来就留空
+    param([string]$Body)
+    $r = @{ Version = ''; ServerName = ''; ServerVer = ''; ErrCode = ''; ErrMsg = ''; SupportedVersions = ''; ResultType = '' }
+    if (-not $Body) { return $r }
+    try { $j = $Body | ConvertFrom-Json } catch { return $r }
+    if ($j.error) { $r.ErrCode = [string]$j.error.code; $r.ErrMsg = [string]$j.error.message }
+    if ($j.result) {
+        $res = $j.result
+        if ($res.protocolVersion)   { $r.Version = [string]$res.protocolVersion }
+        if ($res.supportedVersions) { $r.SupportedVersions = ($res.supportedVersions -join ', ') }
+        if ($res.resultType)        { $r.ResultType = [string]$res.resultType }
+        if ($res.serverInfo) {
+            $r.ServerName = [string]$res.serverInfo.name
+            $r.ServerVer  = [string]$res.serverInfo.version
+        }
+    }
+    return $r
+}
+
+function Get-ProbeVerdict {
+    param($InitCode, $Init, $DiscCode, $Disc)
+    if ($InitCode -in @('401', '403') -or $DiscCode -in @('401', '403')) { return 'auth' }
+    if ($InitCode -eq '000' -and $DiscCode -eq '000') { return 'unreachable' }
+    if ($Disc.ResultType -or $Disc.SupportedVersions) { return 'new' }
+    if ($Init.Version) { return 'old' }
+    return 'unknown'
+}
+
+function Get-DefaultProbeUrl {
+    # 默认填配置里第一条代理的上游，省得每次手敲；取不到就给本地占位
+    try {
+        $cfg = Get-RelayConfig -Root $root
+        $p = @($cfg.Proxies | Where-Object { $_.enabled -ne $false } | Select-Object -First 1)
+        if ($p.Count -eq 1) {
+            $t = [string]$p[0].Target
+            if ($t -match '^(https?://)?([^:]+):(\d+)') {
+                $host2 = $Matches[2]; $port2 = $Matches[3]
+                # 注意：再做一次 -match 会覆盖 $Matches，所以主机/端口先存出来
+                $sch = if ($t -match '^https://') { 'https' } else { 'http' }
+                return ("${sch}://{0}:{1}/mcp" -f $host2, $port2)
+            }
+        }
+    } catch { }
+    return 'http://127.0.0.1:27124/mcp'
+}
+
+function Set-ProbeResult {
+    param([string]$Text)
+    $script:txtProbeResult.Text = $Text
+}
+
+function Render-ProbeResult {
+    param([string]$Raw)
+    $line = @{}
+    foreach ($ln in ($Raw -split "`r?`n")) {
+        $i = $ln.IndexOf('=')
+        if ($i -gt 0) { $line[$ln.Substring(0, $i)] = $ln.Substring($i + 1) }
+    }
+    $url  = $line['URL']; if (-not $url) { $url = '(未知)' }
+    $initCode = $line['INIT_HTTP']; $initSession = $line['INIT_SESSION']
+    $discCode = $line['DISC_HTTP']
+    $init = Parse-ProbeBody $line['INIT_BODY']
+    $disc = Parse-ProbeBody $line['DISC_BODY']
+    $verdict = Get-ProbeVerdict $initCode $init $discCode $disc
+
+    $sb = New-Object Text.StringBuilder
+    [void]$sb.AppendLine('目标: ' + $url)
+    [void]$sb.AppendLine('探测时间: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('--- 旧规范探测: initialize（2025-11-25，有状态握手）---')
+    [void]$sb.AppendLine(('HTTP ' + $initCode + '    会话: ' + $(if ($initSession) { $initSession } else { '无 Mcp-Session-Id' })))
+    if ($init.Version)      { [void]$sb.AppendLine('协商版本: ' + $init.Version) }
+    if ($init.ServerName)   { [void]$sb.AppendLine('服务端: ' + $init.ServerName + ' ' + $init.ServerVer) }
+    if ($init.ErrCode)      { [void]$sb.AppendLine('错误: [' + $init.ErrCode + '] ' + $init.ErrMsg) }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('--- 新规范探测: server/discover（2026-07-28，无状态）---')
+    [void]$sb.AppendLine('HTTP ' + $discCode)
+    if ($disc.ResultType)       { [void]$sb.AppendLine('resultType: ' + $disc.ResultType) }
+    if ($disc.SupportedVersions) { [void]$sb.AppendLine('supportedVersions: ' + $disc.SupportedVersions) }
+    if ($disc.ServerName)       { [void]$sb.AppendLine('服务端: ' + $disc.ServerName + ' ' + $disc.ServerVer) }
+    if ($disc.ErrCode)          { [void]$sb.AppendLine('错误: [' + $disc.ErrCode + '] ' + $disc.ErrMsg) }
+    [void]$sb.AppendLine('')
+
+    $concl = ''; $conclColor = 'gray'
+    switch ($verdict) {
+        'old' {
+            $concl = '结论: 旧规范（有状态握手，' + $init.Version + '）。客户端若按 2026-07-28 无状态规范直连，需要桥接层做握手与会话适配。'
+            $conclColor = 'red'
+        }
+        'new' {
+            $concl = '结论: 新规范（2026-07-28 无状态）。discover 已应答，理论上同规范客户端可直连。'
+            $conclColor = 'green'
+        }
+        'auth' {
+            $concl = '结论: 需要鉴权（401/403）。在「令牌」框填入 Bearer 令牌后再探测；连上之后才能判断协议版本。'
+            $conclColor = 'orange'
+        }
+        'unreachable' {
+            $concl = '结论: 连不上。检查地址、端口与上游是否在跑；经反代访问时也要确认监听地址可达。'
+            $conclColor = 'red'
+        }
+        default {
+            $concl = '结论: 不确定。两次探测都没有返回标准 JSON-RPC 结果，可能不是 MCP 端点，或报文结构与预期不同，看上面原始错误。'
+            $conclColor = 'orange'
+        }
+    }
+    [void]$sb.AppendLine($concl)
+
+    $rt = $script:txtProbeResult
+    $rt.Clear()
+    $rt.SelectionColor = [Drawing.Color]::Black
+    $rt.AppendText($sb.ToString())
+    $color = switch ($conclColor) {
+        'red'    { [Drawing.Color]::FromArgb(192, 0, 0) }
+        'green'  { [Drawing.Color]::FromArgb(0, 120, 0) }
+        'orange' { [Drawing.Color]::FromArgb(192, 110, 0) }
+        default  { [Drawing.Color]::Gray }
+    }
+    # 给结论那一行单独上色：行号按总行数定位最后一行
+    $lines = ($sb.ToString() -split "`r?`n")
+    $rt.Select($rt.GetFirstCharIndexFromLine($lines.Count - 2), $concl.Length)
+    $rt.SelectionColor = $color
+    $rt.SelectionLength = 0
+}
+
+function Start-Probe {
+    if ($script:probeHandle -and -not $script:probeHandle.IsCompleted) { return }
+    $url = $script:txtProbeUrl.Text.Trim()
+    if (-not $url) { Set-ProbeResult '请先填上游 MCP 地址。'; return }
+    $token = $script:txtProbeToken.Text.Trim()
+    $script:btnProbe.Enabled = $false
+    Set-ProbeResult '探测中…（initialize 与 server/discover 各最多等 5 秒）'
+    $ps = [PowerShell]::Create()
+    [void]$ps.AddScript($script:probeTaskCode)
+    [void]$ps.AddArgument($url)
+    [void]$ps.AddArgument($token)
+    $script:probePs = $ps
+    $script:probeHandle = $ps.BeginInvoke()
+    $script:probeTimer.Start()
+}
+
 function Hide-ToTray {
     $script:ni.Text = $script:trayHint
     $script:ni.Visible = $true
@@ -704,6 +921,34 @@ function Import-ConfigFile {
     if ($script:lblCfgState) { $script:lblCfgState.Text = '已载入: ' + [IO.Path]::GetFileName($path) + '   （点「重启代理」= 先校验，再存到 mcp-relay.config.json）' }
     $script:tabs.SelectedTab = $script:tabEdit
     Write-UiLog ('config imported from ' + $path)
+}
+
+# 把编辑框里的当前内容导出到用户选定的文件：保存对话框选路径，点「保存」即直接写盘。
+# 与「导入」对称：导出的是编辑框里的现状（含尚未点「重启代理」保存的改动），不是磁盘上的旧文件。
+function Export-ConfigFile {
+    if (-not $script:txtCfg) { return }
+    $txt = [string]$script:txtCfg.Text
+    if (-not $txt -or -not $txt.Trim()) {
+        [Windows.Forms.MessageBox]::Show('配置内容是空的，没有可导出的内容。', '导出配置文件', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        return
+    }
+    $dlg = New-Object Windows.Forms.SaveFileDialog
+    $dlg.Title = '导出当前配置到文件'
+    $dlg.InitialDirectory = $root
+    $dlg.Filter = 'JSON 配置 (*.json)|*.json|所有文件 (*.*)|*.*'
+    $dlg.FileName = 'mcp-relay.config.json'
+    $dlg.OverwritePrompt = $true
+    if ($dlg.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) { return }
+    $path = $dlg.FileName
+    try {
+        # 与项目其它写配置处保持一致：CRLF + UTF-8 无 BOM
+        [IO.File]::WriteAllText($path, (To-Crlf $txt), (New-Object Text.UTF8Encoding($false)))
+    } catch {
+        [Windows.Forms.MessageBox]::Show('导出失败: ' + $_.Exception.Message, '导出配置文件', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        return
+    }
+    if ($script:lblCfgState) { $script:lblCfgState.Text = '已导出到: ' + $path }
+    Write-UiLog ('config exported to ' + $path)
 }
 
 # 把一个日志文件读成条目：每条带时间戳；没有时间戳的续行沿用上一条的时间
@@ -1305,10 +1550,23 @@ $script:lblCfgState = $lblCfgState
 # 打开/载入别的配置文件到编辑框（改完照样点「重启代理」校验+保存）
 $btnLoadCfg = New-Object Windows.Forms.Button
 $btnLoadCfg.Text = '导入配置文件'
-$btnLoadCfg.Location = New-Object Drawing.Point(462, 52)
-$btnLoadCfg.Size = New-Object Drawing.Size(164, 28)
+$btnLoadCfg.AutoSize = $true
+$btnLoadCfg.AutoSizeMode = [Windows.Forms.AutoSizeMode]::GrowAndShrink
+$btnLoadCfg.Padding = New-Object Windows.Forms.Padding(4, 2, 4, 2)
+$btnLoadCfg.Location = New-Object Drawing.Point(430, 52)
 $btnLoadCfg.add_Click({ Import-ConfigFile })
 $tabEdit.Controls.Add($btnLoadCfg)
+
+# 导出编辑框当前内容到文件（保存对话框选路径，点「保存」即写盘）
+$btnSaveCfg = New-Object Windows.Forms.Button
+$btnSaveCfg.Text = '导出配置文件'
+$btnSaveCfg.AutoSize = $true
+$btnSaveCfg.AutoSizeMode = [Windows.Forms.AutoSizeMode]::GrowAndShrink
+$btnSaveCfg.Padding = New-Object Windows.Forms.Padding(4, 2, 4, 2)
+$btnSaveCfg.Location = New-Object Drawing.Point(530, 52)
+$btnSaveCfg.add_Click({ Export-ConfigFile })
+$tabEdit.Controls.Add($btnSaveCfg)
+$script:btnSaveCfg = $btnSaveCfg
 
 # 配置编辑区 = 左边行号栏（自绘 Panel）+ 右边富文本框；外面套 1px 灰边框
 # 行号是独立控件：不能编辑、不会跟着鼠标选中，正文里想复制也不会把数字带出去。
@@ -1770,7 +2028,59 @@ $script:txtLogRelay = $txtLogRelay
 $tabLog.Controls.Add($logTabs)
 $script:logTabs = $logTabs
 
-# --- tab 5：使用说明（说明书）---
+# --- tab 5：MCP 版本探针 ---
+$tabProbe = New-Object Windows.Forms.TabPage
+$tabProbe.Text = 'MCP版本探针'
+$tabProbe.Padding = New-Object Windows.Forms.Padding(3)
+[void]$tabs.Controls.Add($tabProbe)
+$script:tabProbe = $tabProbe
+
+$lblProbeHint = New-Object Windows.Forms.Label
+$lblProbeHint.Text = "填上游 MCP 地址（一般是 http(s)://127.0.0.1:端口/mcp），点「开始探测」：探针分别按旧规范发 initialize、按新规范发 server/discover，看上游认哪一套，据此判断协议代际。令牌可选，上游要 Bearer 时再填。"
+$lblProbeHint.AutoSize = $false
+$lblProbeHint.TextAlign = [Drawing.ContentAlignment]::TopLeft
+$panelProbeHint = New-HintPanel $lblProbeHint 54
+$tabProbe.Controls.Add($panelProbeHint)
+$script:panelProbeHint = $panelProbeHint
+
+$lblProbeUrl = New-Object Windows.Forms.Label
+$lblProbeUrl.Text = '上游地址:'
+$tabProbe.Controls.Add($lblProbeUrl)
+$script:lblProbeUrl = $lblProbeUrl
+
+$txtProbeUrl = New-Object Windows.Forms.TextBox
+$txtProbeUrl.Text = (Get-DefaultProbeUrl)
+$tabProbe.Controls.Add($txtProbeUrl)
+$script:txtProbeUrl = $txtProbeUrl
+
+$lblProbeToken = New-Object Windows.Forms.Label
+$lblProbeToken.Text = '令牌:'
+$tabProbe.Controls.Add($lblProbeToken)
+$script:lblProbeToken = $lblProbeToken
+
+$txtProbeToken = New-Object Windows.Forms.TextBox
+$txtProbeToken.PasswordChar = [char]0x2022
+$tabProbe.Controls.Add($txtProbeToken)
+$script:txtProbeToken = $txtProbeToken
+
+$btnProbe = New-Object Windows.Forms.Button
+$btnProbe.Text = '开始探测'
+$tabProbe.Controls.Add($btnProbe)
+$script:btnProbe = $btnProbe
+
+$txtProbeResult = New-Object Windows.Forms.RichTextBox
+$txtProbeResult.ReadOnly = $true
+$txtProbeResult.DetectUrls = $false
+$txtProbeResult.ScrollBars = [Windows.Forms.RichTextBoxScrollBars]::Vertical
+$txtProbeResult.WordWrap = $true
+$txtProbeResult.Font = New-Object Drawing.Font('Consolas', 9)
+$txtProbeResult.BackColor = [Drawing.Color]::White
+$tabProbe.Controls.Add($txtProbeResult)
+$script:txtProbeResult = $txtProbeResult
+
+$btnProbe.add_Click({ Start-Probe })
+
+# --- tab 6：使用说明（说明书）---
 $tabHelp = New-Object Windows.Forms.TabPage
 $tabHelp.Text = '使用说明'
 $tabHelp.Padding = New-Object Windows.Forms.Padding(3)
@@ -1847,6 +2157,9 @@ XMCP 局域网反代工具 · 使用说明
      "rewrite_host": false, "upstream_timeout": 60
    点「重启代理」——先校验格式，通过才写盘（旧文件备份 .bak）并重启；
    随后在状态页 [监听] 确认新端口已 LISTENING，[连通性] 显示「连通」。
+4. 「MCP版本探针」页：填上游地址点「开始探测」，分别按旧规范 initialize、新规范
+   server/discover 各打一发，给出协议代际结论（旧规范有状态握手 / 新规范无状态 /
+   需要令牌 / 连不上）。客户端连不上某个 MCP 时，先用它判断上游是哪一代规范。
 
 六、几个容易踩的点
 · rewrite_host 只在服务端校验 Host 时才设 true（XTerminal 必须 true，否则 403）；
@@ -2140,6 +2453,24 @@ $script:taskTimer.add_Tick({
     }
 })
 
+# 探针后台任务的轮询（与反代启停的 taskTimer 互不干扰）
+$script:probeTimer = New-Object Windows.Forms.Timer
+$script:probeTimer.Interval = 400
+$script:probeTimer.add_Tick({
+    if (-not $script:probeHandle) { $script:probeTimer.Stop(); return }
+    $done = $true
+    try { $done = $script:probeHandle.IsCompleted } catch { $done = $true }
+    if (-not $done) { return }
+    $script:probeTimer.Stop()
+    $raw = ''
+    try { $raw = (@($script:probePs.EndInvoke($script:probeHandle)) -join "`n") } catch { $raw = 'ERR=' + $_.Exception.Message }
+    try { $script:probePs.Dispose() } catch { }
+    $script:probePs = $null
+    $script:probeHandle = $null
+    try { Render-ProbeResult $raw } catch { Set-ProbeResult ('探针异常: ' + $_.Exception.Message) }
+    $script:btnProbe.Enabled = $true
+})
+
 # 窗体可拉伸：所有控件按当前客户区重新排布（不依赖 Anchor，本机 Anchor 会算错尺寸）
 function Update-Layout {
     try {
@@ -2163,7 +2494,11 @@ function Update-Layout {
         $script:panelEdit.Location = New-Object Drawing.Point(6, 4)
         $script:panelEdit.Size = New-Object Drawing.Size(($pw - 12), 46)
         $script:lblCfgState.Location = New-Object Drawing.Point(8, 58)
-        $btnLoadCfg.Location = New-Object Drawing.Point(($pw - 170), 54)
+        # 「导入 / 导出」两个按钮：AutoSize 按实测文字宽度自适应（换 DPI / 缩放都不裁字），整体右对齐（右边距 6、间距 4）
+        $wSave = $script:btnSaveCfg.PreferredSize.Width
+        $wLoad = $btnLoadCfg.PreferredSize.Width
+        $script:btnSaveCfg.Location = New-Object Drawing.Point(($pw - 6 - $wSave), 54)
+        $btnLoadCfg.Location        = New-Object Drawing.Point(($pw - 6 - $wSave - 4 - $wLoad), 54)
         $script:panelCfgBox.Location = New-Object Drawing.Point(6, 90)
         $script:panelCfgBox.Size = New-Object Drawing.Size(($pw - 12), ($ph - 120))
         $script:lblCfgError.Location = New-Object Drawing.Point(8, ($ph - 26))
@@ -2177,6 +2512,21 @@ function Update-Layout {
         $btnLogRefresh.Location = New-Object Drawing.Point(6, ($ph - 32))
         $btnLogOpen.Location = New-Object Drawing.Point(108, ($ph - 32))
         $btnLogOpenUi.Location = New-Object Drawing.Point(274, ($ph - 32))
+        # MCP 版本探针页（说明框 + 地址/令牌一行 + 探测按钮 + 结果框）
+        $script:panelProbeHint.Location = New-Object Drawing.Point(6, 4)
+        $script:panelProbeHint.Size = New-Object Drawing.Size(($pw - 12), 54)
+        $script:lblProbeUrl.Location = New-Object Drawing.Point(6, 64)
+        $script:lblProbeUrl.Size = New-Object Drawing.Size(64, 22)
+        $script:txtProbeUrl.Location = New-Object Drawing.Point(74, 62)
+        $script:txtProbeUrl.Size = New-Object Drawing.Size(($pw - 180), 22)
+        $script:lblProbeToken.Location = New-Object Drawing.Point(($pw - 170), 64)
+        $script:lblProbeToken.Size = New-Object Drawing.Size(64, 22)
+        $script:txtProbeToken.Location = New-Object Drawing.Point(($pw - 104), 62)
+        $script:txtProbeToken.Size = New-Object Drawing.Size(98, 22)
+        $btnProbe.Location = New-Object Drawing.Point(6, 92)
+        $btnProbe.Size = New-Object Drawing.Size(96, 26)
+        $script:txtProbeResult.Location = New-Object Drawing.Point(6, 126)
+        $script:txtProbeResult.Size = New-Object Drawing.Size(($pw - 12), ($ph - 126))
         # 使用说明页 / 关于软件页：整页一个带边框的阅读框
         $script:panelHelp.Location = New-Object Drawing.Point(6, 6)
         $script:panelHelp.Size = New-Object Drawing.Size(($pw - 12), ($ph - 12))
@@ -2231,8 +2581,10 @@ try {
     [Windows.Forms.Application]::Run($form)
 } finally {
     try { $script:taskTimer.Stop(); $script:taskTimer.Dispose() } catch { }
+    try { $script:probeTimer.Stop(); $script:probeTimer.Dispose() } catch { }
     try { $script:cfgUiTimer.Stop(); $script:cfgUiTimer.Dispose() } catch { }
     try { if ($script:bgPs) { $script:bgPs.Dispose() } } catch { }
+    try { if ($script:probePs) { $script:probePs.Dispose() } } catch { }
     try { if ($script:singleton) { $script:singleton.ReleaseMutex(); $script:singleton.Dispose() } } catch { }
     try { $script:ni.Visible = $false; $script:ni.Dispose() } catch { }
     Write-UiLog 'console exited'

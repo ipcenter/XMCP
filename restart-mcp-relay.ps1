@@ -1,4 +1,4 @@
-# 停止 + 启动 在同一个 powershell 进程里一次跑完
+﻿# 停止 + 启动 在同一个 powershell 进程里一次跑完
 # 为什么要合并：控制台每起一个子 powershell，光是进程冷启动就约 1.9 秒。
 # 原来「重启代理」要起两个子进程（stop-mcp-relay.ps1 + start-mcp-relay.ps1），
 # 合并成一个能实打实省掉一次冷启动。
