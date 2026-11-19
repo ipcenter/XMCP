@@ -17,6 +17,13 @@ MCP / HTTP 局域网反代（配置驱动，可挂多个代理）
 所以配置里的 rewrite_host: true 表示"把 Host 头改写成上游地址"，
 这是 XTerminal 这类本机服务必需的行为；普通 HTTP 服务可设为 false。
 
+上游支持两种协议：
+  "target": "127.0.0.1:12335"          -> 明文 HTTP（老写法，等价 http://）
+  "target": "https://127.0.0.1:27124"  -> 反代自己去和上游谈 TLS
+后一种是给"只开 HTTPS 的本机服务"用的（例如 Obsidian 的 Local REST API，
+它的 HTTP 端口在某些版本上开不起来）。反代不校验上游证书，因为这类服务
+用的都是自签证书；对外仍然是明文 HTTP，客户端不用改任何设置。
+
 只依赖标准库，支持 SSE / Streamable HTTP 流式响应（chunked 透传）。
 
 用法：
@@ -31,6 +38,7 @@ import json
 import os
 import socket
 import socketserver
+import ssl
 import sys
 import threading
 import time
@@ -39,6 +47,14 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("XT_MCP_RELAY_CONFIG") or os.path.join(
     SCRIPT_DIR, "mcp-relay.config.json"
 )
+
+# 上游写 https:// 时用的 TLS 上下文。
+# 这类本地服务（Obsidian 的 Local REST API 就是）清一色自签证书，
+# 证书链和主机名都校验不过，只能关掉校验；链路只在同一台机器的
+# 127.0.0.1 上，不存在中间人可插入的位置，关校验是安全的。
+SSL_CONTEXT = ssl.create_default_context()
+SSL_CONTEXT.check_hostname = False
+SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
 
 def strip_comments(text):
@@ -185,6 +201,27 @@ def parse_addr(text, field):
     return host, port
 
 
+def parse_target(text, field):
+    """解析上游，返回 (host, port, scheme)。scheme 是 'http' 或 'https'。
+
+    允许三种写法：127.0.0.1:12335、http://127.0.0.1:12335、https://127.0.0.1:27124。
+    不写协议就按 http（老配置一行都不用改）。上游是 TLS 时，不写 https:// 就会被
+    当明文发过去，表现为"上游不回任何字节就断开"，反代只能回 502 —— 所以协议这段
+    必须显式写上。
+    """
+    if not isinstance(text, str):
+        raise ValueError("%s 必须是字符串，收到: %r" % (field, text))
+    scheme = "http"
+    rest = text.strip()
+    for prefix, name in (("https://", "https"), ("http://", "http")):
+        if rest[: len(prefix)].lower() == prefix:
+            scheme = name
+            rest = rest[len(prefix):]
+            break
+    rest = rest.split("/")[0]           # 允许顺手写个路径后缀，这里只取地址部分
+    return parse_addr(rest, field) + (scheme,)
+
+
 def load_config():
     """读配置并做校验，返回 (proxies, log_settings)。出错抛 ValueError。"""
     if os.path.exists(CONFIG_PATH):
@@ -222,7 +259,8 @@ def load_config():
         for entry in listen_raw:
             listens.append(parse_addr(entry, "%s.listen" % name))
 
-        target = parse_addr(item.get("target"), "%s.target" % name)
+        target_host, target_port, target_scheme = parse_target(item.get("target"), "%s.target" % name)
+        target = (target_host, target_port)
 
         rewrite = bool(item.get("rewrite_host", True))
         host_header = item.get("host_header")
@@ -242,6 +280,7 @@ def load_config():
                 "name": name,
                 "listen": listens,
                 "target": target,
+                "target_scheme": target_scheme,
                 "rewrite_host": rewrite,
                 "host_header": host_header,
                 "timeout": timeout,
@@ -312,7 +351,11 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
 
         # ---- 3. 请求上游 ----
         target_host, target_port = cfg["target"]
-        conn = http.client.HTTPConnection(target_host, target_port, timeout=cfg["timeout"])
+        if cfg.get("target_scheme") == "https":
+            conn = http.client.HTTPSConnection(target_host, target_port, timeout=cfg["timeout"],
+                                               context=SSL_CONTEXT)
+        else:
+            conn = http.client.HTTPConnection(target_host, target_port, timeout=cfg["timeout"])
         try:
             conn.request(method, path, body=body, headers=headers)
             response = conn.getresponse()
@@ -447,9 +490,10 @@ def main():
                     s.server_close()
                 return 2
             servers.append((proxy, srv, host, port))
-            log("LISTEN %-16s http://%s:%d  ->  http://%s:%d%s" % (
+            log("LISTEN %-16s http://%s:%d  ->  %s://%s:%d%s" % (
                 "[" + proxy["name"] + "]",
                 host, port,
+                proxy.get("target_scheme") or "http",
                 proxy["target"][0], proxy["target"][1],
                 ("  (Host 改写为 " + proxy["host_header"] + ")") if proxy["rewrite_host"] else "",
             ))

@@ -30,6 +30,16 @@
       "target": "127.0.0.1:8080",
       "rewrite_host": false,
       "upstream_timeout": 60
+    },
+    {
+      "name": "示例-只开HTTPS的上游",
+      "enabled": false,
+      "listen": [
+        "192.168.1.10:27124"
+      ],
+      "target": "https://127.0.0.1:27124",# 上游是 TLS（例如 Obsidian 的 Local REST API）；反代自己去谈 TLS，不校验证书，对外仍是明文 HTTP
+      "rewrite_host": true,
+      "upstream_timeout": 60
     }
   ]
 }

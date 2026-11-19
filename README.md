@@ -97,7 +97,7 @@ powershell -ExecutionPolicy Bypass -File ".\check-mcp-relay.ps1"     # 只做连
 | `proxies[].name` | 代理名称，只用于显示 |
 | `proxies[].enabled` | `false` 则不启动这一组 |
 | `proxies[].listen` | 对外监听地址，`"IP:端口"`，可写多个（IPv6 用 `[::1]:端口`） |
-| `proxies[].target` | 上游真实地址，通常 `127.0.0.1:端口` |
+| `proxies[].target` | 上游真实地址，通常 `127.0.0.1:端口`；上游只开 HTTPS 时写 `https://127.0.0.1:端口`（见下方「上游是 HTTPS」） |
 | `proxies[].rewrite_host` | 是否把 Host 头改写为 `target`。上游校验 Host → `true`；普通按域名分发的 Web 服务 → `false` |
 | `proxies[].upstream_timeout` | 上游空闲超时（秒）。长连接类 MCP / SSE 建议调大（如 3600） |
 | `log.file` / `log.max_bytes` | 反代日志文件名与单文件上限，超出自动轮转 |
@@ -106,6 +106,22 @@ powershell -ExecutionPolicy Bypass -File ".\check-mcp-relay.ps1"     # 只做连
 | `firewall.remote_address` | 只对这个网段放行，默认同网段 `/24` |
 
 **加一个服务，4 步**：复制一段 `proxies` 项 → 改 `name` / `listen` / `target` → 需要就改 `rewrite_host` → 保存并重启。
+
+### 上游是 HTTPS
+
+有些本机服务只开加密端口（典型例子：Obsidian 的 Local REST API，默认 `port=27124` 是 HTTPS，
+`insecurePort=27123` 那条 HTTP 服务在一些版本上根本起不来）。这种上游直接写协议前缀即可：
+
+```json
+{ "name": "obsidian-mcp", "listen": ["192.168.110.1:27124"],
+  "target": "https://127.0.0.1:27124", "rewrite_host": true }
+```
+
+- 反代自己跟上游谈 TLS，**不校验证书**（这类服务清一色自签证书，校验必失败；链路只在同一台机器的
+  `127.0.0.1` 上，没有中间人可插入的位置）。
+- 对外仍是明文 HTTP，客户端不用装证书、不用改设置：`http://192.168.110.1:27124/`。
+- 不写 `https://` 会怎样：明文打到 TLS 端口，上游一个字节都不回就断开，日志是
+  `UPSTREAM FAIL ... Remote end closed connection without response`，客户端拿到 `502`。
 
 ---
 
@@ -138,7 +154,7 @@ powershell -ExecutionPolicy Bypass -File ".\check-mcp-relay.ps1"     # 只做连
 
 不能转（或转了也没意义）：
 - UDP 服务；
-- 需要 TLS 终结、路径重写的场景（这里是纯 TCP 转发 + Host 改写）；
+- 需要路径重写、改响应体的场景（这里只做端口转发 + Host 改写；HTTPS 上游只是把 TLS 谈到反代这一层）；
 - 服务端自己校验来源 IP / 令牌白名单（转发后源 IP 变成运行本程序的机器）；
 - 需要开机自启常驻（本工具是桌面程序，不注册服务）。
 
@@ -150,6 +166,7 @@ powershell -ExecutionPolicy Bypass -File ".\check-mcp-relay.ps1"     # 只做连
 |---|---|
 | 连通性显示 `000` 不通 | 端口没应答：上游没启动、`target` 端口写错、或防火墙没放行 |
 | 显示 `401` / `404` 但标「连通」 | **这是好事**：状态码来自上游，说明链路已打通（`401` 只是缺令牌，`404` 只是路径不对） |
+| 连通性标「连通」但返回 `502` | `502` 是反代自己回的：它没拿到上游响应。常见于"上游其实是 HTTPS、`target` 却写成明文"。日志里对应 `UPSTREAM FAIL ... Remote end closed connection without response`，把 `target` 改成 `https://…` 即可 |
 | `403 Invalid Host` | 把 `rewrite_host` 改成 `true` |
 | 虚拟机连不上，宿主机自己能连 | 检查 `listen` 是否是虚拟网卡网关地址（如 VMware 的 `192.168.x.1`）、防火墙是否放行、虚拟机与宿主机是否同网段 |
 | 端口被占用 / 监听没起来 | 反代进程已在跑（`mcp-relay.pid`），或另一个副本也在跑；先「2. 退出关闭」再启动 |
