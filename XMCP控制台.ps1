@@ -546,23 +546,37 @@ function Start-RelayTask {
 }
 
 # ===== MCP 版本探针 =====
-# 后台任务：分别按旧规范 initialize、新规范 server/discover 各打一发，带回响应头与正文。
-# 只做探测、不改报文；解析和结论判定放回 UI 线程做。
+# 后台任务：旧规范 initialize（有状态握手）、新规范 server/discover（无状态）各打一发，
+# 有会话号再探 GET 通知流与 DELETE 会话；只做探测、不改报文，解析和结论判定放回 UI 线程。
 $script:probeTaskCode = @'
 param($Url, $Token)
 $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
 if (-not (Test-Path -LiteralPath $curl)) { $curl = 'curl.exe' }
 
+# 用户可能粘贴成 "Bearer xxx"，这里去掉重复前缀，避免发出 "Bearer Bearer xxx"
+$tok = ($Token -replace '^\s*Bearer\s+', '').Trim()
+
 function Invoke-McpPost {
-    param($Url, $Token, $Method, $Version, $Params, $Meta)
+    param($Url, $Tok, $Method, $Version, $Params, $EnvelopeMeta, $McpMethod)
     $headers = @('-H', 'Content-Type: application/json', '-H', 'Accept: application/json, text/event-stream')
-    if ($Token)  { $headers += @('-H', ('Authorization: Bearer ' + $Token)) }
+    if ($Tok)   { $headers += @('-H', ('Authorization: Bearer ' + $Tok)) }
     if ($Version) { $headers += @('-H', ('MCP-Protocol-Version: ' + $Version)) }
-    $bodyObj = [ordered]@{ jsonrpc = '2.0'; id = 1; method = $Method; params = $Params }
-    if ($Meta) { $bodyObj['_meta'] = $Meta }
+    if ($McpMethod) { $headers += @('-H', ('Mcp-Method: ' + $McpMethod)) }
+    $bodyParams = $Params
+    if ($EnvelopeMeta) { $bodyParams = ($Params + @{ _meta = $EnvelopeMeta }) }
+    $bodyObj = [ordered]@{ jsonrpc = '2.0'; id = 1; method = $Method; params = $bodyParams }
     $body = ($bodyObj | ConvertTo-Json -Compress -Depth 6)
     # -i 带回响应头；-k 忽略自签证书（探针只做诊断，和反代侧 CERT_NONE 一致）；--noproxy 不走系统代理；--max-time 5 防止卡死 UI 等待
     $raw = & $curl -sS -k -i --noproxy '*' --max-time 5 -X POST $Url @headers -d $body 2>&1 | Out-String
+    return $raw
+}
+
+function Invoke-McpRequest {
+    param($Url, $Tok, $HttpMethod, $Session, $MaxTime)
+    $headers = @('-H', 'Accept: text/event-stream, application/json')
+    if ($Tok) { $headers += @('-H', ('Authorization: Bearer ' + $Tok)) }
+    if ($Session) { $headers += @('-H', ('Mcp-Session-Id: ' + $Session)) }
+    $raw = & $curl -sS -k -i --noproxy '*' --max-time $MaxTime -X $HttpMethod $Url @headers 2>&1 | Out-String
     return $raw
 }
 
@@ -598,28 +612,50 @@ $initParams = @{
     capabilities    = @{}
     clientInfo      = @{ name = 'xmcp-probe'; version = '1.0' }
 }
-$meta = @{ 'io.modelcontextprotocol' = @{ protocolVersion = '2026-07-28' } }
+# 2026-07-28 无状态规范：信封 _meta 放在 params 内，键是扁平的 io.modelcontextprotocol/* 路径
+$meta = [ordered]@{
+    'io.modelcontextprotocol/protocolVersion'  = '2026-07-28'
+    'io.modelcontextprotocol/clientInfo'       = @{ name = 'xmcp-probe'; version = '1.0' }
+    'io.modelcontextprotocol/clientCapabilities' = @{}
+}
 
-$initRaw = Invoke-McpPost -Url $u -Token $Token -Method 'initialize'    -Version '2025-11-25' -Params $initParams
-$discRaw = Invoke-McpPost -Url $u -Token $Token -Method 'server/discover' -Version '2026-07-28' -Params @{} -Meta $meta
+$initRaw = Invoke-McpPost -Url $u -Tok $tok -Method 'initialize'     -Version '2025-11-25' -Params $initParams
+$discRaw = Invoke-McpPost -Url $u -Tok $tok -Method 'server/discover' -Version '2026-07-28' -Params @{} -EnvelopeMeta $meta -McpMethod 'server/discover'
 
 $init = Split-Response $initRaw
 $disc = Split-Response $discRaw
 
+# 只有旧规范握出了会话号，才去探通知流与会话删除；新规范无会话，不探
+$getCode = '–'; $delCode = '–'
+if ($init.Session) {
+    $get = Split-Response (Invoke-McpRequest -Url $u -Tok $tok -HttpMethod 'GET'    -Session $init.Session -MaxTime 3)
+    $getCode = $get.Code
+    $del = Split-Response (Invoke-McpRequest -Url $u -Tok $tok -HttpMethod 'DELETE' -Session $init.Session -MaxTime 5)
+    $delCode = $del.Code
+}
+
 $out = @()
 $out += ('URL=' + $u)
+$out += ('TOKEN_PRESENT=' + $(if ($tok) { 'yes' } else { 'no' }))
 $out += ('INIT_HTTP=' + $init.Code)
 $out += ('INIT_SESSION=' + $init.Session)
 $out += ('INIT_BODY=' + $init.Body)
 $out += ('DISC_HTTP=' + $disc.Code)
 $out += ('DISC_BODY=' + $disc.Body)
+$out += ('GET_HTTP=' + $getCode)
+$out += ('DEL_HTTP=' + $delCode)
 $out -join "`n"
 '@
 
 function Parse-ProbeBody {
-    # 从单条 JSON-RPC 响应里抠出版本 / 服务端信息 / 错误码；抠不出来就留空
+    # 从单条 JSON-RPC 响应里抠出版本 / 能力 / 服务端信息 / 错误码；抠不出来就留空
     param([string]$Body)
-    $r = @{ Version = ''; ServerName = ''; ServerVer = ''; ErrCode = ''; ErrMsg = ''; SupportedVersions = ''; ResultType = '' }
+    $r = @{
+        Version = ''; ServerName = ''; ServerVer = ''
+        ErrCode = ''; ErrMsg = ''
+        SupportedVersions = ''; ResultType = ''
+        Tools = $false; Resources = $false; Prompts = $false
+    }
     if (-not $Body) { return $r }
     try { $j = $Body | ConvertFrom-Json } catch { return $r }
     if ($j.error) { $r.ErrCode = [string]$j.error.code; $r.ErrMsg = [string]$j.error.message }
@@ -628,9 +664,17 @@ function Parse-ProbeBody {
         if ($res.protocolVersion)   { $r.Version = [string]$res.protocolVersion }
         if ($res.supportedVersions) { $r.SupportedVersions = ($res.supportedVersions -join ', ') }
         if ($res.resultType)        { $r.ResultType = [string]$res.resultType }
-        if ($res.serverInfo) {
-            $r.ServerName = [string]$res.serverInfo.name
-            $r.ServerVer  = [string]$res.serverInfo.version
+        if ($res.capabilities) {
+            if ($res.capabilities.tools)     { $r.Tools = $true }
+            if ($res.capabilities.resources) { $r.Resources = $true }
+            if ($res.capabilities.prompts)    { $r.Prompts = $true }
+        }
+        # 服务端信息：旧规范在 result.serverInfo；新规范在 result._meta.io.modelcontextprotocol/serverInfo
+        $si = $res.serverInfo
+        if (-not $si -and $res._meta) { $si = $res._meta.'io.modelcontextprotocol/serverInfo' }
+        if ($si) {
+            $r.ServerName = [string]$si.name
+            $r.ServerVer  = [string]$si.version
         }
     }
     return $r
@@ -640,8 +684,11 @@ function Get-ProbeVerdict {
     param($InitCode, $Init, $DiscCode, $Disc)
     if ($InitCode -in @('401', '403') -or $DiscCode -in @('401', '403')) { return 'auth' }
     if ($InitCode -eq '000' -and $DiscCode -eq '000') { return 'unreachable' }
-    if ($Disc.ResultType -or $Disc.SupportedVersions) { return 'new' }
-    if ($Init.Version) { return 'old' }
+    $initOk = [bool]$Init.Version
+    $discOk = [bool]($Disc.SupportedVersions -or $Disc.ResultType)
+    if ($initOk -and $discOk) { return 'dual' }
+    if ($discOk) { return 'new' }
+    if ($initOk) { return 'old' }
     return 'unknown'
 }
 
@@ -668,6 +715,16 @@ function Set-ProbeResult {
     $script:txtProbeResult.Text = $Text
 }
 
+# 三态：yes=✓ 绿 / no=✗ 红 / unknown=? 灰 / na=– 灰
+function Get-CheckState {
+    param($Code, [string]$OkCodes)
+    if ($null -eq $Code -or $Code -eq '–' -or $Code -eq '') { return 'na' }
+    if ($Code -eq '000') { return 'unknown' }
+    $ok = $OkCodes -split ','
+    if ($ok -contains $Code) { return 'yes' }
+    return 'no'
+}
+
 function Render-ProbeResult {
     param([string]$Raw)
     $line = @{}
@@ -677,78 +734,112 @@ function Render-ProbeResult {
     }
     $url  = $line['URL']; if (-not $url) { $url = '(未知)' }
     $initCode = $line['INIT_HTTP']; $initSession = $line['INIT_SESSION']
-    $discCode = $line['DISC_HTTP']
+    $discCode = $line['DISC_HTTP']; $getCode = $line['GET_HTTP']; $delCode = $line['DEL_HTTP']
     $init = Parse-ProbeBody $line['INIT_BODY']
     $disc = Parse-ProbeBody $line['DISC_BODY']
     $verdict = Get-ProbeVerdict $initCode $init $discCode $disc
 
-    $sb = New-Object Text.StringBuilder
-    [void]$sb.AppendLine('目标: ' + $url)
-    [void]$sb.AppendLine('探测时间: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
-    [void]$sb.AppendLine('')
-    [void]$sb.AppendLine('--- 旧规范探测: initialize（2025-11-25，有状态握手）---')
-    [void]$sb.AppendLine(('HTTP ' + $initCode + '    会话: ' + $(if ($initSession) { $initSession } else { '无 Mcp-Session-Id' })))
-    if ($init.Version)      { [void]$sb.AppendLine('协商版本: ' + $init.Version) }
-    if ($init.ServerName)   { [void]$sb.AppendLine('服务端: ' + $init.ServerName + ' ' + $init.ServerVer) }
-    if ($init.ErrCode)      { [void]$sb.AppendLine('错误: [' + $init.ErrCode + '] ' + $init.ErrMsg) }
-    [void]$sb.AppendLine('')
-    [void]$sb.AppendLine('--- 新规范探测: server/discover（2026-07-28，无状态）---')
-    [void]$sb.AppendLine('HTTP ' + $discCode)
-    if ($disc.ResultType)       { [void]$sb.AppendLine('resultType: ' + $disc.ResultType) }
-    if ($disc.SupportedVersions) { [void]$sb.AppendLine('supportedVersions: ' + $disc.SupportedVersions) }
-    if ($disc.ServerName)       { [void]$sb.AppendLine('服务端: ' + $disc.ServerName + ' ' + $disc.ServerVer) }
-    if ($disc.ErrCode)          { [void]$sb.AppendLine('错误: [' + $disc.ErrCode + '] ' + $disc.ErrMsg) }
-    [void]$sb.AppendLine('')
+    $black  = [Drawing.Color]::Black
+    $green  = [Drawing.Color]::FromArgb(0, 120, 0)
+    $red    = [Drawing.Color]::FromArgb(192, 0, 0)
+    $orange = [Drawing.Color]::FromArgb(192, 110, 0)
+    $gray   = [Drawing.Color]::Gray
+    $rt = $script:txtProbeResult
+    $rt.Clear()
 
-    $concl = ''; $conclColor = 'gray'
+    function Add-Line {
+        param([string]$Text, $Color = $black)
+        $rt.SelectionColor = $Color
+        $rt.AppendText($Text + "`r`n")
+    }
+    function State-Symbol { param($State)
+        switch ($State) { 'yes' { '✓' } 'no' { '✗' } 'na' { '–' } default { '?' } }
+    }
+    function State-Color { param($State)
+        switch ($State) { 'yes' { $green } 'no' { $red } default { $gray } }
+    }
+
+    Add-Line 'MCP Server 检测报告' $black
+    Add-Line ('目标: ' + $url)
+    Add-Line ('探测时间: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    Add-Line ('鉴权: ' + $(if ($line['TOKEN_PRESENT'] -eq 'yes') { '已带令牌' } else { '未填令牌（上游若要 Bearer，结果会是 401）' }))
+    Add-Line ''
+
+    # --- 协议兼容性：两条腿分别按真实响应判定 ---
+    Add-Line '协议兼容性' $black
+    $initOk = [bool]$init.Version
+    $discOk = [bool]($disc.SupportedVersions -or $disc.ResultType)
+    $initState = if ($initCode -in @('401', '403')) { 'unknown' } elseif ($initOk) { 'yes' } elseif ($initCode -eq '000') { 'unknown' } else { 'no' }
+    $discState = if ($discCode -in @('401', '403')) { 'unknown' } elseif ($discOk) { 'yes' } elseif ($discCode -eq '000') { 'unknown' } else { 'no' }
+    $initNote = if ($initOk) { 'HTTP ' + $initCode + ' · 协商版本 ' + $init.Version } else { 'HTTP ' + $initCode + $(if ($init.ErrCode) { ' · [' + $init.ErrCode + '] ' + $init.ErrMsg }) }
+    $discNote = if ($discOk) { 'HTTP ' + $discCode + ' · supportedVersions: ' + $disc.SupportedVersions } else { 'HTTP ' + $discCode + $(if ($disc.ErrCode) { ' · [' + $disc.ErrCode + '] ' + $disc.ErrMsg }) }
+    Add-Line ('  [' + (State-Symbol $initState) + '] 2025-11-25 Sessionful    ' + $initNote) (State-Color $initState)
+    Add-Line ('  [' + (State-Symbol $discState) + '] 2026-07-28 Stateless     ' + $discNote) (State-Color $discState)
+    Add-Line ''
+
+    # --- 会话能力：会话号 / 通知流 / 会话删除 ---
+    Add-Line '会话能力' $black
+    $sidState = if ($initSession) { 'yes' } elseif ($initCode -in @('401', '403', '000')) { 'unknown' } else { 'no' }
+    Add-Line ('  [' + (State-Symbol $sidState) + '] Mcp-Session-Id      ' + $(if ($initSession) { $initSession } else { '响应头未带会话号' })) (State-Color $sidState)
+    $getState = Get-CheckState $getCode '200'
+    $delState = Get-CheckState $delCode '200,202,204'
+    Add-Line ('  [' + (State-Symbol $getState) + '] GET Notification Stream   HTTP ' + $getCode) (State-Color $getState)
+    Add-Line ('  [' + (State-Symbol $delState) + '] DELETE Session            HTTP ' + $delCode) (State-Color $delState)
+    Add-Line ''
+
+    # --- 服务端能力：两条腿上报的 capabilities 取并集 ---
+    Add-Line '服务端能力（来自 capabilities）' $black
+    $tools = $init.Tools -or $disc.Tools
+    $res   = $init.Resources -or $disc.Resources
+    $prom  = $init.Prompts -or $disc.Prompts
+    $capState = { param($b) if ($b) { 'yes' } else { 'no' } }
+    Add-Line ('  [' + (State-Symbol (& $capState $tools)) + '] Tools   [' + (State-Symbol (& $capState $res)) + '] Resources   [' + (State-Symbol (& $capState $prom)) + '] Prompts') $black
+    Add-Line ''
+
+    $server = $init.ServerName; $serverVer = $init.ServerVer
+    if (-not $server) { $server = $disc.ServerName; $serverVer = $disc.ServerVer }
+    if ($server) { Add-Line ('服务端: ' + $server + ' ' + $serverVer) }
+    Add-Line ''
+
+    # --- 结论 ---
+    $concl = ''; $conclColor = $gray
     switch ($verdict) {
+        'dual' {
+            $concl = '结论: 新旧两套协议都支持（Sessionful + Stateless），同规范客户端一般可直连。'
+            $conclColor = $green
+        }
         'old' {
-            $concl = '结论: 旧规范（有状态握手，' + $init.Version + '）。客户端若按 2026-07-28 无状态规范直连，需要桥接层做握手与会话适配。'
-            $conclColor = 'red'
+            $concl = '结论: 仅旧规范（有状态握手，' + $init.Version + '）。按 2026-07-28 无状态规范来的客户端，需要桥接层做握手与会话适配。'
+            $conclColor = $orange
         }
         'new' {
-            $concl = '结论: 新规范（2026-07-28 无状态）。discover 已应答，理论上同规范客户端可直连。'
-            $conclColor = 'green'
+            $concl = '结论: 仅新规范（2026-07-28 无状态）。旧规范客户端需要桥接。'
+            $conclColor = $green
         }
         'auth' {
-            $concl = '结论: 需要鉴权（401/403）。在「令牌」框填入 Bearer 令牌后再探测；连上之后才能判断协议版本。'
-            $conclColor = 'orange'
+            $concl = '结论: 被鉴权拦截（401/403），协议版本未能判定。在「令牌」框填入 Bearer 令牌后再探测。'
+            $conclColor = $orange
         }
         'unreachable' {
             $concl = '结论: 连不上。检查地址、端口与上游是否在跑；经反代访问时也要确认监听地址可达。'
-            $conclColor = 'red'
+            $conclColor = $red
         }
         default {
-            $concl = '结论: 不确定。两次探测都没有返回标准 JSON-RPC 结果，可能不是 MCP 端点，或报文结构与预期不同，看上面原始错误。'
-            $conclColor = 'orange'
+            $concl = '结论: 不确定。两条腿都没返回标准 JSON-RPC 结果，可能不是 MCP 端点，或报文结构与预期不同，看上面各行原始错误。'
+            $conclColor = $orange
         }
     }
-    [void]$sb.AppendLine($concl)
-
-    $rt = $script:txtProbeResult
-    $rt.Clear()
-    $rt.SelectionColor = [Drawing.Color]::Black
-    $rt.AppendText($sb.ToString())
-    $color = switch ($conclColor) {
-        'red'    { [Drawing.Color]::FromArgb(192, 0, 0) }
-        'green'  { [Drawing.Color]::FromArgb(0, 120, 0) }
-        'orange' { [Drawing.Color]::FromArgb(192, 110, 0) }
-        default  { [Drawing.Color]::Gray }
-    }
-    # 给结论那一行单独上色：行号按总行数定位最后一行
-    $lines = ($sb.ToString() -split "`r?`n")
-    $rt.Select($rt.GetFirstCharIndexFromLine($lines.Count - 2), $concl.Length)
-    $rt.SelectionColor = $color
-    $rt.SelectionLength = 0
+    Add-Line $concl $conclColor
 }
 
 function Start-Probe {
     if ($script:probeHandle -and -not $script:probeHandle.IsCompleted) { return }
     $url = $script:txtProbeUrl.Text.Trim()
     if (-not $url) { Set-ProbeResult '请先填上游 MCP 地址。'; return }
-    $token = $script:txtProbeToken.Text.Trim()
+    # 去重 Bearer 前缀：用户贴 "Bearer xxx" 和只贴 "xxx" 都按裸令牌处理
+    $token = ($script:txtProbeToken.Text.Trim() -ireplace '^\s*Bearer\s+', '').Trim()
     $script:btnProbe.Enabled = $false
-    Set-ProbeResult '探测中…（initialize 与 server/discover 各最多等 5 秒）'
+    Set-ProbeResult '探测中…（initialize / discover / 会话通道，各最多等 5 秒）'
     $ps = [PowerShell]::Create()
     [void]$ps.AddScript($script:probeTaskCode)
     [void]$ps.AddArgument($url)
@@ -2157,9 +2248,10 @@ XMCP 局域网反代工具 · 使用说明
      "rewrite_host": false, "upstream_timeout": 60
    点「重启代理」——先校验格式，通过才写盘（旧文件备份 .bak）并重启；
    随后在状态页 [监听] 确认新端口已 LISTENING，[连通性] 显示「连通」。
-4. 「MCP版本探针」页：填上游地址点「开始探测」，分别按旧规范 initialize、新规范
-   server/discover 各打一发，给出协议代际结论（旧规范有状态握手 / 新规范无状态 /
-   需要令牌 / 连不上）。客户端连不上某个 MCP 时，先用它判断上游是哪一代规范。
+4. 「MCP版本探针」页：填上游地址点「开始探测」。探针分别按旧规范 initialize、
+   新规范 server/discover 各打一发，有会话号再探通知流与会话删除，输出兼容性报告：
+   两条协议腿是否支持、会话能力（会话号 / GET 流 / DELETE 会话）、服务端能力
+   （Tools / Resources / Prompts），结论分双协议 / 仅旧 / 仅新 / 需要令牌 / 连不上。
 
 六、几个容易踩的点
 · rewrite_host 只在服务端校验 Host 时才设 true（XTerminal 必须 true，否则 403）；
