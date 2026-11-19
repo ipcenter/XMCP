@@ -2165,6 +2165,7 @@ $script:btnProbe = $btnProbe
 $txtProbeResult = New-Object Windows.Forms.RichTextBox
 $txtProbeResult.ReadOnly = $true
 $txtProbeResult.DetectUrls = $false
+$txtProbeResult.ShortcutsEnabled = $true
 $txtProbeResult.ScrollBars = [Windows.Forms.RichTextBoxScrollBars]::Vertical
 $txtProbeResult.WordWrap = $true
 $txtProbeResult.Font = New-Object Drawing.Font('Consolas', 9)
@@ -2415,6 +2416,7 @@ $btnSelCopy.add_Click({
             '状态'     { $box = $script:txtStatus }
             '配置格式' { $box = $txtSample }
             '配置内容' { $box = $script:txtCfg }
+            'MCP版本探针' { $box = $script:txtProbeResult }
             '使用说明' { $box = $script:txtHelp }
             '关于软件' { $box = $script:txtAbout }
             '运行日志' {
@@ -2622,6 +2624,7 @@ function Update-Layout {
         $btnProbe.Size = New-Object Drawing.Size(96, 26)
         $script:txtProbeResult.Location = New-Object Drawing.Point(6, 166)
         $script:txtProbeResult.Size = New-Object Drawing.Size(($pw - 12), ($ph - 166))
+        Set-TextInnerPad $script:txtProbeResult
         # 使用说明页 / 关于软件页：整页一个带边框的阅读框
         $script:panelHelp.Location = New-Object Drawing.Point(6, 6)
         $script:panelHelp.Size = New-Object Drawing.Size(($pw - 12), ($ph - 12))
