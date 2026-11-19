@@ -34,6 +34,10 @@ function Write-FirewallFingerprint {
         }
     } catch { }
 }
+function Clear-FirewallPending {
+    # 清掉「后台提权更新中」标记：控制台状态页看到这个文件就提示用户去点 UAC
+    try { Remove-Item -LiteralPath (Join-Path $root 'firewall-pending.txt') -Force -ErrorAction SilentlyContinue } catch { }
+}
 function Write-FirewallState($Rules) {
     try {
         $lines = @()
@@ -102,6 +106,7 @@ Say ("  目标规则: " + $desired.Count + " 条（Allow " + $ports.Count + "，
 if ($missing.Count -eq 0 -and $extra.Count -eq 0) {
     Say "  状态: 已一致，无需修改。"
     Write-FirewallFingerprint
+    Clear-FirewallPending
     exit 0
 }
 
@@ -157,4 +162,5 @@ if ($stillMissing.Count -gt 0) {
 }
 Say ("  完成: 现有 " + $after.Count + " 条规则，与配置一致。")
 Write-FirewallFingerprint
+Clear-FirewallPending
 exit 0

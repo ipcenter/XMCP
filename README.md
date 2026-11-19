@@ -56,6 +56,7 @@ powershell -ExecutionPolicy Bypass -File ".\XMCP控制台.ps1" -BootstrapOnly
 ```powershell
 powershell -ExecutionPolicy Bypass -File ".\start-mcp-relay.ps1"     # 只起反代
 powershell -ExecutionPolicy Bypass -File ".\stop-mcp-relay.ps1"      # 只停反代
+powershell -ExecutionPolicy Bypass -File ".\restart-mcp-relay.ps1"   # 重启（停+启一个进程内跑完，比分别调省一次冷启动）
 powershell -ExecutionPolicy Bypass -File ".\check-mcp-relay.ps1"     # 只做连通性检测
 ```
 
@@ -154,6 +155,7 @@ powershell -ExecutionPolicy Bypass -File ".\check-mcp-relay.ps1"     # 只做连
 | 端口被占用 / 监听没起来 | 反代进程已在跑（`mcp-relay.pid`），或另一个副本也在跑；先「2. 退出关闭」再启动 |
 | 找不到 python | 装 Python 3 并勾选加入 PATH，或把 `pythonw.exe` 加到 PATH |
 | 换了目录，状态页还显示老路径 | 双击的是被拷过来的旧快捷方式；先双击一次本目录的 `XMCP控制台.bat`，快捷方式会自动纠正 |
+| 「重启代理」要等二十多秒 | 曾经的主因是反代给每个监听地址做反向 DNS 解析（`HTTPServer.server_bind` 里的 `socket.getfqdn`），内网 IP 没 PTR 时每个地址卡约 9 秒；现已改成跳过反解，正常 5–10 秒（详见代码注释） |
 
 ---
 
@@ -165,6 +167,7 @@ XMCP控制台.ps1            窗口控制台（界面 + 配置校验 + 启停调
 xterminal-mcp-lan-relay.py 反代主体（纯标准库，名字沿用首版场景，逻辑通用）
 relay-config.ps1          配置解析（支持 # 注释、尾逗号）
 start/stop/check-mcp-relay.ps1  命令行入口
+restart-mcp-relay.ps1     重启（停+启合并在一个进程，省一次 powershell 冷启动）
 firewall-sync.ps1         防火墙同步
 validate-config.py        配置严格校验
 format-config.py          配置格式化
@@ -173,7 +176,7 @@ mcp-relay.config.example.json  配置样例
 重建快捷方式.bat          手动重建桌面快捷方式
 ```
 
-运行时产物（首次运行自动生成，不要提交）：`mcp-relay.config.json`、`mcp-relay.log`、`mcp-relay.pid`、`xmcp-console.log`、`xmcp-console-status.txt`、`firewall-state.txt`、`firewall-fingerprint.txt`、`*.lnk`。
+运行时产物（首次运行自动生成，不要提交）：`mcp-relay.config.json`、`mcp-relay.log`、`mcp-relay.pid`、`xmcp-console.log`、`xmcp-console-status.txt`、`firewall-state.txt`、`firewall-fingerprint.txt`、`firewall-pending.txt`、`*.lnk`。
 
 ---
 

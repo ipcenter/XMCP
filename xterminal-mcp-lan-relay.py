@@ -399,6 +399,16 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def server_bind(self):
+        # 为什么要覆盖：http.server.HTTPServer.server_bind() 里有一步 socket.getfqdn(host)，
+        # 那是反向 DNS 解析。本机 DNS 解析不通时（内网 IP 没有 PTR 记录很常见），
+        # 每建一个监听地址就要卡 9 秒左右 —— 4 个地址能让"重启代理"多等近 20 秒。
+        # 这里跳过反解：server_name 直接填监听地址本身，功能上没有任何影响。
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
+
 
 def make_handler(proxy_cfg):
     return type("RelayHandler_%s" % str(proxy_cfg["name"]).replace("-", "_"),

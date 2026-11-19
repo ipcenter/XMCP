@@ -87,13 +87,25 @@ if ($cfg.Firewall.Enabled) {
             ForEach-Object { Write-Host "  $_" }
         $code = $LASTEXITCODE
         if ($code -eq 1) {
-            Write-Host "  检测到差异，正在提权更新（会弹 UAC，请点“是”）..."
-            Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -ArgumentList @(
-                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $syncPath + '"'), '-Apply'
-            ) | Out-Null
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $syncPath 2>&1 |
-                ForEach-Object { Write-Host "  $_" }
-            if ($LASTEXITCODE -ne 0) { Write-Host "  警告: 防火墙仍未同步，新增端口可能对虚拟机不可达。" }
+            # 有差异：后台异步提权，不卡启动
+            # 原来这里用 -Wait 一直等到用户点 UAC（实测最坏 77 秒），
+            # 但反代启动本身并不依赖防火墙同步：先让反代跑起来，规则慢慢补。
+            Write-Host "  检测到差异，已在后台发起提权更新（会弹 UAC，请点“是”）。"
+            Write-Host "  反代照常启动，不等它；更新完成后状态页 [防火墙] 段会变成新快照。"
+            $pending = Join-Path $root 'firewall-pending.txt'
+            try {
+                [IO.File]::WriteAllText($pending, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), (New-Object Text.UTF8Encoding($false)))
+            } catch { }
+            try {
+                Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList @(
+                    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $syncPath + '"'), '-Apply'
+                ) | Out-Null
+            } catch {
+                # 用户在 UAC 上点了「否」，或提权被策略拦下
+                Write-Host "  提权被取消/失败（$($_.Exception.Message)）。"
+                Write-Host "  需要的话以管理员身份运行 firewall-sync.ps1 -Apply，或删掉 firewall-fingerprint.txt 后重启代理重试。"
+                Remove-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue
+            }
         } elseif ($code -ne 0) {
             Write-Host "  警告: 防火墙检查未通过（exit $code），继续启动但可能不通。"
         }

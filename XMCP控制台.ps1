@@ -17,6 +17,7 @@ $cfgPath  = Join-Path $root 'mcp-relay.config.json'
 $pidFile  = Join-Path $root 'mcp-relay.pid'
 $startPs1 = Join-Path $root 'start-mcp-relay.ps1'
 $stopPs1  = Join-Path $root 'stop-mcp-relay.ps1'
+$restartPs1 = Join-Path $root 'restart-mcp-relay.ps1'
 $uiLog    = Join-Path $root 'xmcp-console.log'
 $uiSnap   = Join-Path $root 'xmcp-console-status.txt'
 $pywExe   = 'C:\Python314\pythonw.exe'
@@ -232,21 +233,60 @@ function Get-StatusText {
 
     [void]$sb.AppendLine('[代理]')
     $firstAddr = ''
+    # 先把每个代理的"名字 + 地址清单"收集起来，再统一按像素算列宽：
+    # 名字单独占一行（行尾挂 [Host改写] 这类标记），地址行从同一缩进起，
+    # 不同代理、不同地址的箭头和上游就自然落在同一列。
+    # （按字符数补空格补不齐：空格宽度和字母宽度不是一个量，中文还会回退字形）
+    $pBlocks = @()
     foreach ($p in $cfg.Proxies) {
         $listens = @()
         for ($i = 0; $i -lt $p.ListenHost.Count; $i++) { $listens += ($p.ListenHost[$i] + ':' + $p.ListenPort[$i]) }
         if (-not $firstAddr -and $p.ListenHost.Count -gt 0) { $firstAddr = $p.ListenHost[0] + ':' + $p.ListenPort[0] }
-        $tag = ''
-        if ($p.RewriteHost) { $tag = '  [Host改写]' }
-        # 每个监听地址单独一行，避免一行太长被折成两半（第二行用等宽空格缩进对齐）
-        $head = '  [' + $p.Name + '] '
-        if ($listens.Count -eq 0) {
-            [void]$sb.AppendLine($head + '(没写 listen 地址)  ->  ' + $p.Target + $tag)
-        } else {
-            for ($i = 0; $i -lt $listens.Count; $i++) {
-                $lead = if ($i -eq 0) { $head } else { ' ' * $head.Length }
-                $lineTag = if ($i -eq 0) { $tag } else { '' }
-                [void]$sb.AppendLine($lead + $listens[$i].PadRight(22) + ' ->  ' + $p.Target + $lineTag)
+        if ($listens.Count -eq 0) { $listens = @('(没写 listen 地址)') }
+        $pBlocks += [pscustomobject]@{
+            Name    = ('  [' + $p.Name + ']')
+            Listens = $listens
+            Target  = $p.Target
+            Tag     = if ($p.RewriteHost) { '[Host改写]' } else { '' }
+        }
+    }
+    if ($pBlocks.Count -gt 0) {
+        $stFont = if ($script:txtStatus) { $script:txtStatus.Font } else { New-Object Drawing.Font('Consolas', 9) }
+        $stSize = New-Object Drawing.Size(1000, 40)
+        $stFlags = [Windows.Forms.TextFormatFlags]::NoPadding
+        $meas = {
+            param([string]$s)
+            [int][Windows.Forms.TextRenderer]::MeasureText($s, $stFont, $stSize, $stFlags).Width
+        }
+        $spaceW = & $meas ' '
+        if ($spaceW -lt 1) { $spaceW = 4 }
+        # 补空格到某个像素列：先按平均字宽估个数，再按实际宽度前后微调一格
+        $padToCol = {
+            param([string]$s, [int]$x)
+            $n = [int][Math]::Max(1, [Math]::Round(($x - (& $meas $s)) / $spaceW))
+            while ($n -gt 1 -and (& $meas ($s + (' ' * ($n - 1)))) -ge $x) { $n-- }
+            while ((& $meas ($s + (' ' * $n))) -lt $x) { $n++ }
+            return $s + (' ' * $n)
+        }
+        $indent = '        '                     # 地址行缩进（名字行是 2 空格，地址行再进 6 格）
+        $indentW = & $meas $indent
+        $addrW = 0
+        foreach ($b in $pBlocks) {
+            foreach ($l in $b.Listens) {
+                $w = & $meas $l
+                if ($w -gt $addrW) { $addrW = $w }
+            }
+        }
+        $arrowX = $indentW + $addrW + 16         # 箭头列
+        $firstBlock = $true
+        foreach ($b in $pBlocks) {
+            if (-not $firstBlock) { [void]$sb.AppendLine('') }   # 代理之间空一行，眼睛容易分组
+            $firstBlock = $false
+            $line = $b.Name
+            if ($b.Tag) { $line = $line + '  ' + $b.Tag }
+            [void]$sb.AppendLine($line)
+            foreach ($l in $b.Listens) {
+                [void]$sb.AppendLine((& $padToCol ($indent + $l) $arrowX) + '->  ' + $b.Target)
             }
         }
     }
@@ -316,6 +356,14 @@ function Get-StatusText {
     } else {
         [void]$sb.AppendLine('[防火墙] 还没有快照 —— 启动/重启一次代理即生成（firewall-sync.ps1 会写）')
     }
+    # 提权更新是后台异步跑的（不再卡启动），这里提醒用户还有一步要手动点
+    $pendingFile = Join-Path $root 'firewall-pending.txt'
+    if (Test-Path -LiteralPath $pendingFile) {
+        $since = ''
+        try { $since = (Get-Content -LiteralPath $pendingFile -Raw).Trim() } catch { }
+        [void]$sb.AppendLine('  [待办] 防火墙后台提权更新中（发起于 ' + $since + '）：UAC 还没点就点一下“是”，')
+        [void]$sb.AppendLine('        完成后这行会自动消失；反代不受影响，已经在跑。')
+    }
 
     return $sb.ToString()
 }
@@ -357,6 +405,13 @@ function Set-StatusText {
                 $box.Select($m.Index, 2)
                 if ($m.Groups[1].Value -eq '连通') { $box.SelectionColor = [Drawing.Color]::FromArgb(0, 100, 0) }
                 else { $box.SelectionColor = [Drawing.Color]::FromArgb(200, 0, 0) }
+            }
+            # 代理名字行尾的 [Host改写]：蓝色、小一号，当提示看，不抢地址那几行的视线
+            $rxTag = [regex]'\[Host改写\]'
+            foreach ($m in $rxTag.Matches($box.Text)) {
+                $box.Select($m.Index, $m.Length)
+                $box.SelectionFont = New-Object Drawing.Font('Consolas', 8)
+                $box.SelectionColor = [Drawing.Color]::FromArgb(30, 90, 200)
             }
             $box.Select(0, 0)
         } catch { }
@@ -421,35 +476,43 @@ function Update-Status {
 
 # ---- 代理启停放到后台 runspace，UI 线程不被占用（窗口可拖动 / 可最小化 / 不"未响应"）----
 $script:relayTaskCode = @'
-param($Mode, $StopPs1, $StartPs1, $Addresses)
+param($Mode, $RestartPs1, $StartPs1, $Addresses)
 $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 if (-not (Test-Path -LiteralPath $exe)) { $exe = 'powershell.exe' }
-$curl = Join-Path $env:SystemRoot 'System32\curl.exe'
-if (-not (Test-Path -LiteralPath $curl)) { $curl = 'curl.exe' }
+$netstat = Join-Path $env:SystemRoot 'System32\netstat.exe'
+if (-not (Test-Path -LiteralPath $netstat)) { $netstat = 'netstat.exe' }
 $log = @()
 if ($Mode -eq 'Restart') {
-    $o = & $exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $StopPs1 2>&1 | Out-String
-    $log += ('stop | ' + ($o -replace "`r?`n", ' ; '))
+    # 停+启塞进同一个子 powershell：每起一个子进程光冷启动就约 1.9 秒，合并能省一次
+    $o = & $exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $RestartPs1 2>&1 | Out-String
+    $log += ('restart | ' + ($o -replace "`r?`n", ' ; '))
+} else {
+    $o = & $exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $StartPs1 2>&1 | Out-String
+    $log += ('start | ' + ($o -replace "`r?`n", ' ; '))
 }
-$o2 = & $exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $StartPs1 2>&1 | Out-String
-$log += ('start | ' + ($o2 -replace "`r?`n", ' ; '))
-# 等端口真正能应答（反代从启动到绑定约 10 秒，等太久会误判"不通"）
+# 等端口真正进入 LISTENING：netstat 一次约 0.1 秒
+# 旧版是顺序 curl 每个地址 --max-time 2，反代还没绑上时每个都吃满 2 秒，一轮就要 8 秒多，
+# 而日志只记了 sleep 时间（写着"1.4 秒"实际等了十几秒），把人误导得很惨
 $list = @()
 if ($Addresses) { $list = $Addresses.Split(',') }
-$waited = 0
-for ($i = 0; $i -lt 30; $i++) {
+$targets = @()
+foreach ($a in $list) { if ($a) { $targets += $a.Trim() } }
+$allUp = $false
+$swWait = [Diagnostics.Stopwatch]::StartNew()
+while ($swWait.Elapsed.TotalSeconds -lt 30) {
+    $ns = (& $netstat -ano | Out-String)
     $allUp = $true
-    foreach ($a in $list) {
-        if (-not $a) { continue }
-        $code = (& $curl -sS -o NUL -w '%{http_code}' --max-time 2 ("http://" + $a + "/") 2>$null)
-        $code = ([string]$code).Trim()
-        if (-not $code -or $code -eq '000') { $allUp = $false }
+    foreach ($a in $targets) {
+        # 只认"地址:端口"这一条自己 LISTENING，别被 127.0.0.1 上别的程序同端口骗过去
+        $rx = [regex]([regex]::Escape($a) + '\s+[^\s]+\s+LISTENING')
+        if (-not $rx.IsMatch($ns)) { $allUp = $false; break }
     }
     if ($allUp) { break }
-    Start-Sleep -Milliseconds 700
-    $waited = $i + 1
+    Start-Sleep -Milliseconds 300
 }
-$log += ('wait | 等端口应答 ' + [Math]::Round($waited * 0.7, 1) + ' 秒')
+$waitSec = [Math]::Round($swWait.Elapsed.TotalSeconds, 1)
+$waitNote = if ($allUp) { '（全部就绪）' } else { '（超时：有地址没起来，看下面 [监听]）' }
+$log += ('wait | 等端口监听 ' + $waitSec + ' 秒 ' + $waitNote)
 $log -join ' || '
 '@
 
@@ -465,12 +528,12 @@ function Start-RelayTask {
     $script:btnQuit.Enabled = $false
     $label = '正在启动代理…'
     if ($Mode -eq 'Restart') { $label = '正在重启代理…' }
-    Set-StatusText ($label + "`r`n" + '约 10–20 秒完成。窗口此时可以正常拖动、可以点右上角"-"最小化、也可以点 X 收进托盘，完成后会自动刷新结果。')
+    Set-StatusText ($label + "`r`n" + '一般 5–10 秒完成。窗口此时可以正常拖动、可以点右上角"-"最小化、也可以点 X 收进托盘，完成后会自动刷新结果。')
     Write-UiLog ('relay task start: ' + $Mode)
     $ps = [PowerShell]::Create()
     [void]$ps.AddScript($script:relayTaskCode)
     [void]$ps.AddArgument($Mode)
-    [void]$ps.AddArgument($stopPs1)
+    [void]$ps.AddArgument($restartPs1)
     [void]$ps.AddArgument($startPs1)
     [void]$ps.AddArgument((Get-CheckAddresses))
     $script:bgPs = $ps
@@ -604,6 +667,8 @@ function Reload-ConfigEditor {
     $script:txtCfg.Text = $txt
     $script:suppressDirty = $false
     $script:configDirty = $false          # TextChanged 会在赋值时触发，这里再压回去
+    Update-CfgLineIndex                    # 换过内容要重算行号，否则行号栏还停在上一份配置的行数上
+    Clear-ConfigErrorMark                  # 重新载入就撤掉上一轮的红字标记
     if ($script:lblCfgState) { $script:lblCfgState.Text = '当前文件: mcp-relay.config.json   （改完点「重启代理」保存并重启）' }
     Write-UiLog 'config editor reloaded'
 }
@@ -634,6 +699,8 @@ function Import-ConfigFile {
     $script:configDirty = $true
     $script:txtCfg.SelectionStart = 0
     $script:txtCfg.ScrollToCaret()
+    Update-CfgLineIndex
+    Clear-ConfigErrorMark
     if ($script:lblCfgState) { $script:lblCfgState.Text = '已载入: ' + [IO.Path]::GetFileName($path) + '   （点「重启代理」= 先校验，再存到 mcp-relay.config.json）' }
     $script:tabs.SelectedTab = $script:tabEdit
     Write-UiLog ('config imported from ' + $path)
@@ -718,7 +785,9 @@ function Find-PythonExe {
 
 # 校验 + 保存配置。返回 $true 表示可以继续重启
 function Save-ConfigFromUi {
-    $new = $script:txtCfg.Text
+    # 编辑框是 RichTextBox，.Text 取回来只有 \n（不是 \r\n）；写回文件前统一成 CRLF，
+    # 否则每次保存都会把整份配置的换行符改掉，git diff 一片红。
+    $new = To-Crlf $script:txtCfg.Text
     if (-not $new -or -not $new.Trim()) {
         [Windows.Forms.MessageBox]::Show('配置内容是空的，没有保存。', '配置检查', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
         return $false
@@ -936,10 +1005,10 @@ if __name__ == "__main__":
         $fullForLog = $errText
         if ($rawText -and -not $errFromFile) { $fullForLog = $errText + ' || ' + $rawText }
         Write-UiLog ('config rejected: ' + ($fullForLog -replace "`r?`n", ' | '))
-        $showText = "配置没保存，文件保持原样。`r`n`r`n" + (($errText -replace "`r?`n", ' ').Trim())
-        if ($showText.Length -gt 400) { $showText = $showText.Substring(0, 400) + '…' }
-        $showText += "`r`n`r`n改好后可以再点一次「重启代理」；完整报错在「运行日志」页。"
-        [Windows.Forms.MessageBox]::Show($showText, '配置格式错误', [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        # 先把正文里那一行标红（行号栏同步变红、光标停到该列），再弹红字提示窗，
+        # 两个动作顺序固定：先标位置，用户关掉弹窗时视线已经落在出错行上。
+        Show-ConfigErrorMark $errText
+        Show-ConfigErrorDialog $errText
         return $false
     }
 
@@ -953,10 +1022,12 @@ if __name__ == "__main__":
         return $false
     }
     $script:suppressDirty = $true
-    $script:txtCfg.Text = $new          # 编辑框里也换成排版后的样子
+    $script:txtCfg.Text = $new          # 编辑框里也换成排版后的样子（重设文本会一并清掉上一轮的红字）
     $script:txtCfg.SelectionStart = 0
     $script:txtCfg.ScrollToCaret()
     $script:suppressDirty = $false
+    Update-CfgLineIndex
+    Clear-ConfigErrorMark               # 保存成功：撤掉红字红底，状态行回到"共 N 行 · 光标第几行"
     $script:configDirty = $false
     if ($script:lblCfgState) { $script:lblCfgState.Text = '当前文件: mcp-relay.config.json   （已保存并排版，旧版见 .bak）' }
     Write-UiLog 'config saved (backup: mcp-relay.config.json.bak)'
@@ -1239,19 +1310,364 @@ $btnLoadCfg.Size = New-Object Drawing.Size(164, 28)
 $btnLoadCfg.add_Click({ Import-ConfigFile })
 $tabEdit.Controls.Add($btnLoadCfg)
 
-$txtCfg = New-Object Windows.Forms.TextBox
-$txtCfg.Multiline = $true
-$txtCfg.ScrollBars = [Windows.Forms.ScrollBars]::Vertical
+# 配置编辑区 = 左边行号栏（自绘 Panel）+ 右边富文本框；外面套 1px 灰边框
+# 行号是独立控件：不能编辑、不会跟着鼠标选中，正文里想复制也不会把数字带出去。
+$panelCfgBox = New-Object Windows.Forms.Panel
+$panelCfgBox.BackColor = [Drawing.Color]::FromArgb(176, 176, 176)
+$panelCfgBox.Padding = New-Object Windows.Forms.Padding(1)
+$panelCfgBox.Location = New-Object Drawing.Point(6, 90)
+$panelCfgBox.Size = New-Object Drawing.Size(620, 262)
+$tabEdit.Controls.Add($panelCfgBox)
+$script:panelCfgBox = $panelCfgBox
+
+$innerCfg = New-Object Windows.Forms.Panel
+$innerCfg.Dock = [Windows.Forms.DockStyle]::Fill
+$innerCfg.BackColor = [Drawing.Color]::White
+$panelCfgBox.Controls.Add($innerCfg)
+$script:innerCfg = $innerCfg
+
+$gutterCfg = New-Object Windows.Forms.Panel
+$gutterCfg.BackColor = [Drawing.Color]::FromArgb(247, 247, 247)
+$gutterCfg.Location = New-Object Drawing.Point(0, 0)
+$gutterCfg.Size = New-Object Drawing.Size(46, 260)
+$innerCfg.Controls.Add($gutterCfg)
+$script:gutterCfg = $gutterCfg
+
+# 正文改用 RichTextBox（原来是 TextBox）：只有它能把某一行单独染色，
+# 出错行要标红就得靠这个。其余行为（折行、Tab、等宽字体）和原来保持一致。
+$txtCfg = New-Object Windows.Forms.RichTextBox
+$txtCfg.DetectUrls = $false                 # 关掉自动识别网址，免得配置里的地址被染成蓝色链接
+$txtCfg.BorderStyle = [Windows.Forms.BorderStyle]::None
+$txtCfg.ScrollBars = [Windows.Forms.RichTextBoxScrollBars]::Vertical
 $txtCfg.WordWrap = $true
-$txtCfg.AcceptsReturn = $true
 $txtCfg.AcceptsTab = $true
 $txtCfg.Font = New-Object Drawing.Font('Consolas', 9)
 $txtCfg.BackColor = [Drawing.Color]::White
-$txtCfg.Location = New-Object Drawing.Point(6, 78)
-$txtCfg.Size = New-Object Drawing.Size(620, 286)
-$txtCfg.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Left
-$tabEdit.Controls.Add($txtCfg)
+$txtCfg.Location = New-Object Drawing.Point(46, 0)
+$txtCfg.Size = New-Object Drawing.Size(572, 260)
+$innerCfg.Controls.Add($txtCfg)
 $script:txtCfg = $txtCfg
+
+# 编辑框底下的一行状态：平时显示"共 N 行 / 光标第几行第几列"，校验没过时整行变红写清错误
+$lblCfgError = New-Object Windows.Forms.Label
+$lblCfgError.AutoSize = $false
+$lblCfgError.TextAlign = [Drawing.ContentAlignment]::MiddleLeft
+$lblCfgError.ForeColor = [Drawing.Color]::FromArgb(110, 110, 110)
+$lblCfgError.Location = New-Object Drawing.Point(8, 356)
+$lblCfgError.Size = New-Object Drawing.Size(612, 18)
+$tabEdit.Controls.Add($lblCfgError)
+$script:lblCfgError = $lblCfgError
+
+# ---------------- 行号栏 / 出错标红 ----------------
+# 为什么不用 GetFirstCharIndexFromLine 直接编号：WordWrap=true 时那个 API 走的是"显示行"，
+# 一条长注释折成三行就会被算成三行，编号会串位。这里改按 \n 自己切逻辑行，
+# 再用 GetPositionFromCharIndex 取每行行首的真实纵坐标 —— 折行只占位置，不占编号。
+$script:cfgErrorLine = 0                                     # 1 起算；0 = 当前没有标红的行
+$script:cfgLineStarts = New-Object System.Collections.Generic.List[int]
+[void]$script:cfgLineStarts.Add(0)
+$script:cfgLineCount = 1
+$script:cfgLineIdxLen = -1                                   # 建表时的 TextLength，用来发现"表过期了"
+$script:cfgLineIdxSrcLen = -1                                # 建表时实际扫描的字符串长度（句柄前会带 CR，和 TextLength 不等）
+$script:cfgLineGen = 0                                       # 表的世代号：重建一次 +1，行号栏据此重画
+$script:cfgLineIdxRealized = $false                          # 是否已在句柄就绪后建过表（句柄前的 .Text 不可信）
+$script:gutterSig = ''
+$script:gutterFont = New-Object Drawing.Font('Consolas', 9)
+$script:gutterFontBold = New-Object Drawing.Font('Consolas', 9, [Drawing.FontStyle]::Bold)
+$script:gutterColor = [Drawing.Color]::FromArgb(120, 120, 120)
+$script:gutterColorBad = [Drawing.Color]::FromArgb(198, 30, 30)
+$script:gutterBrush = New-Object Drawing.SolidBrush($script:gutterColor)
+$script:gutterBrushBad = New-Object Drawing.SolidBrush($script:gutterColorBad)
+$script:cfgFontPlain = New-Object Drawing.Font('Consolas', 9)
+$script:cfgFontBold = New-Object Drawing.Font('Consolas', 9, [Drawing.FontStyle]::Bold)
+
+function Update-CfgLineIndex {
+    # 重建逻辑行首字符偏移表（编辑框内容一变就要重建，行号栏和报错定位都靠它）
+    $box = $script:txtCfg
+    if (-not $box) { return }
+    try {
+        $text = [string]$box.Text
+        $list = New-Object System.Collections.Generic.List[int]
+        [void]$list.Add(0)
+        $i = 0
+        while (($i = $text.IndexOf("`n", $i)) -ge 0) {
+            $i += 1
+            [void]$list.Add($i)
+        }
+        $script:cfgLineStarts = $list
+        $script:cfgLineCount = $list.Count
+        $script:cfgLineIdxLen = $box.TextLength
+        $script:cfgLineIdxSrcLen = $text.Length      # 实际扫的那串长度：句柄就绪前 .Text 还是 CRLF 版（比 TextLength 长）
+        $script:cfgLineGen = $script:cfgLineGen + 1
+        if ($box.IsHandleCreated) { $script:cfgLineIdxRealized = $true }
+    } catch { }
+}
+
+function Ensure-CfgLineIndex {
+    # 自愈两道：1) 句柄刚就绪时，之前那次建表不可信（TextChanged 可能在 .Text 定型前就触发了，
+    #    预览时实测过：行号会串位、数字互相叠在一起），强制重建一次；
+    #    2) 之后只要 TextLength 和建表时不一致，也重建。
+    $box = $script:txtCfg
+    if (-not $box) { return }
+    if (-not $box.IsHandleCreated) { return }
+    if (-not $script:cfgLineIdxRealized) { Update-CfgLineIndex; return }
+    # TextLength 是控件内部长度（不含 CR），.Text 在句柄就绪前还会带回 CR，两者不等就说明这张表扫的
+    # 不是同一份文本（实测：表里偏移到 874，而正文只有 838 字符），必须重扫
+    if ($box.TextLength -ne $script:cfgLineIdxLen -or $script:cfgLineIdxSrcLen -ne $box.TextLength) { Update-CfgLineIndex }
+}
+
+function Find-CfgLineAt {
+    # 二分查：给定字符偏移，返回它落在第几个逻辑行（0 起算）
+    param([int]$CharIndex)
+    $starts = $script:cfgLineStarts
+    if (-not $starts -or $starts.Count -lt 1) { return 0 }
+    $lo = 0; $hi = $starts.Count - 1; $hit = 0
+    while ($lo -le $hi) {
+        $mid = [int](($lo + $hi) / 2)
+        if ($starts[$mid] -le $CharIndex) { $hit = $mid; $lo = $mid + 1 } else { $hi = $mid - 1 }
+    }
+    return $hit
+}
+
+function Update-CfgGutter {
+    param([switch]$Force)
+    $gut = $script:gutterCfg
+    $box = $script:txtCfg
+    if (-not $gut -or -not $box) { return }
+    if (-not $gut.IsHandleCreated -or -not $box.IsHandleCreated) { return }
+    try {
+        Ensure-CfgLineIndex
+        # 滚动、改行数、标红行、控件尺寸，这几样没变就不重画，避免无谓闪烁
+        $top = [Math]::Max(0, $box.GetCharIndexFromPosition((New-Object Drawing.Point(1, 1))))
+        $sig = ([string]$top + '|' + [string]$script:cfgLineCount + '|' + [string]$script:cfgErrorLine +
+                '|' + [string]$gut.ClientSize.Height + '|' + [string]$gut.ClientSize.Width + '|' + [string]$script:cfgLineGen)
+        if (-not $Force -and $sig -eq $script:gutterSig) { return }
+        $script:gutterSig = $sig
+        $gut.Invalidate()
+    } catch { }
+}
+
+$gutterCfg.add_Paint({
+    param($sender, $e)
+    $g = $e.Graphics
+    $w = $sender.ClientSize.Width
+    $h = $sender.ClientSize.Height
+    $g.Clear([Drawing.Color]::FromArgb(247, 247, 247))
+    $pen = New-Object Drawing.Pen([Drawing.Color]::FromArgb(214, 214, 214))
+    $g.DrawLine($pen, ($w - 1), 0, ($w - 1), $h)
+    $pen.Dispose()
+    $box = $script:txtCfg
+    if (-not $box -or -not $box.IsHandleCreated) { return }
+    try {
+        Ensure-CfgLineIndex
+        $starts = $script:cfgLineStarts
+        if (-not $starts -or $starts.Count -lt 1) { return }
+        $lineH = [int][Math]::Ceiling($script:gutterFont.GetHeight($g))
+        # 从第一条可见的逻辑行开始画，滚到一半的行也能对上号
+        $topChar = [Math]::Max(0, $box.GetCharIndexFromPosition((New-Object Drawing.Point(1, 1))))
+        $first = Find-CfgLineAt $topChar
+        # 用 GDI 的 TextRenderer 而不是 GDI+ 的 DrawString：行号的 Y 常常是带小数的，
+        # DrawString 会按亚像素抗锯齿，两位数看着像"叠影"；TextRenderer 吸附到整数像素，清楚得多
+        $flags = ([Windows.Forms.TextFormatFlags]::Right -bor
+                  [Windows.Forms.TextFormatFlags]::NoPadding -bor
+                  [Windows.Forms.TextFormatFlags]::SingleLine -bor
+                  [Windows.Forms.TextFormatFlags]::VerticalCenter)
+        for ($i = $first; $i -lt $starts.Count; $i++) {
+            $pt = $box.GetPositionFromCharIndex($starts[$i])
+            if ($pt.Y -gt $h) { break }
+            $num = [string]($i + 1)
+            $rf = New-Object Drawing.Rectangle(0, ([int][Math]::Round($pt.Y)), ($w - 7), $lineH)
+            if (($i + 1) -eq $script:cfgErrorLine) {
+                [Windows.Forms.TextRenderer]::DrawText($g, $num, $script:gutterFontBold, $rf, $script:gutterColorBad, $flags)
+            } else {
+                [Windows.Forms.TextRenderer]::DrawText($g, $num, $script:gutterFont, $rf, $script:gutterColor, $flags)
+            }
+        }
+    } catch { }
+})
+
+function Update-CfgCaretStatus {
+    # 状态行：共几行、光标停在第几行第几列。有报错时让报错文字占着，不覆盖。
+    $lbl = $script:lblCfgError
+    $box = $script:txtCfg
+    if (-not $lbl -or -not $box) { return }
+    if ($script:cfgErrorLine -gt 0) { return }
+    try {
+        Ensure-CfgLineIndex
+        $caret = [Math]::Min([Math]::Max(0, $box.SelectionStart), $box.TextLength)
+        $li = Find-CfgLineAt $caret
+        $t = '共 ' + $script:cfgLineCount + ' 行 · 光标 第 ' + ($li + 1) + ' 行 第 ' + ($caret - $script:cfgLineStarts[$li] + 1) + ' 列'
+        if ($lbl.Text -ne $t) {
+            $lbl.ForeColor = [Drawing.Color]::FromArgb(110, 110, 110)
+            $lbl.Text = $t
+        }
+    } catch { }
+}
+
+function Clear-ConfigErrorMark {
+    # 去掉正文里的红字红底，并把状态行还原成"共 N 行 / 光标位置"
+    $box = $script:txtCfg
+    $script:cfgErrorLine = 0
+    if ($box) {
+        try {
+            $caret = [Math]::Min([Math]::Max(0, $box.SelectionStart), $box.TextLength)
+            $sel = $box.SelectionLength
+            $box.SelectAll()
+            $box.SelectionColor = [Drawing.Color]::Black
+            $box.SelectionBackColor = [Drawing.Color]::White
+            $box.SelectionFont = $script:cfgFontPlain
+            $box.Select($caret, $sel)
+        } catch { }
+    }
+    if ($script:lblCfgError) { $script:lblCfgError.ForeColor = [Drawing.Color]::FromArgb(110, 110, 110) }
+    $script:gutterSig = ''
+    Update-CfgGutter -Force
+    Update-CfgCaretStatus
+}
+
+function Get-ConfigErrorPos {
+    # 从"第 30 行第 9 列附近: …"里把行列抠出来；没写行列（比如结构检查）就返回 0
+    param([string]$Text)
+    $line = 0; $col = 0
+    if ($Text) {
+        $m = [regex]::Match([string]$Text, '第\s*(\d+)\s*行(?:第\s*(\d+)\s*列)?')
+        if ($m.Success) {
+            $line = [int]$m.Groups[1].Value
+            if ($m.Groups[2].Success) { $col = [int]$m.Groups[2].Value }
+        }
+    }
+    return [pscustomobject]@{ Line = $line; Col = $col }
+}
+
+function Show-ConfigErrorMark {
+    # 把出错那一行正文标红（字红 + 浅红底 + 加粗），光标跳到该行并滚到可见处，
+    # 行号栏里同一行的数字也变成红色加粗，三处指同一个位置。
+    param([string]$Text)
+    $box = $script:txtCfg
+    if (-not $box) { return }
+    Clear-ConfigErrorMark
+    Ensure-CfgLineIndex                  # 定位用的是这张偏移表，先确保它跟正文一致
+    $pos = Get-ConfigErrorPos $Text
+    $line = $pos.Line
+    $col = $pos.Col
+    $note = ''
+    if ($line -ge 1 -and $line -le $script:cfgLineCount) {
+        $start = $script:cfgLineStarts[$line - 1]
+        $end = if ($line -lt $script:cfgLineCount) { $script:cfgLineStarts[$line] - 1 } else { $box.TextLength }
+        if ($end -lt $start) { $end = $start }
+        try {
+            $box.Select($start, ($end - $start))
+            $box.SelectionColor = [Drawing.Color]::FromArgb(198, 30, 30)
+            $box.SelectionBackColor = [Drawing.Color]::FromArgb(255, 238, 236)
+            $box.SelectionFont = $script:cfgFontBold
+            # 光标停在报错的那一列上，ScorllToCaret 会把这一行滚进视野
+            $caret = $start
+            if ($col -gt 1) { $caret = [Math]::Min($end, $start + $col - 1) }
+            $box.Select($caret, 0)
+            $box.ScrollToCaret()
+        } catch { }
+        $script:cfgErrorLine = $line
+        $note = '第 ' + $line + ' 行已标红 · '
+    } else {
+        $note = '未通过校验 · '
+    }
+    $msg = (($Text -replace "`r?`n", ' ').Trim())
+    if ($msg.Length -gt 60) { $msg = $msg.Substring(0, 60) + '…' }
+    if ($script:lblCfgError) {
+        $script:lblCfgError.ForeColor = [Drawing.Color]::FromArgb(198, 30, 30)
+        $script:lblCfgError.Text = $note + $msg
+    }
+    $script:gutterSig = ''
+    Update-CfgGutter -Force
+}
+
+function Show-ConfigErrorDialog {
+    # 弹窗替代 MessageBox：MessageBox 的文字颜色改不了，这里自绘一个，
+    # 出错提示本身用红字 + 加粗，行列号放最前面，和左边行号栏对得上。
+    param([string]$Text)
+    $pos = Get-ConfigErrorPos $Text
+    $msg = (($Text -replace "`r?`n", ' ').Trim())
+    if ($msg.Length -gt 320) { $msg = $msg.Substring(0, 320) + '…' }
+
+    $dlg = New-Object Windows.Forms.Form
+    $dlg.Text = '配置格式错误'
+    $dlg.ClientSize = New-Object Drawing.Size(596, 232)
+    $dlg.FormBorderStyle = [Windows.Forms.FormBorderStyle]::FixedDialog
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.ShowInTaskbar = $false
+    $dlg.StartPosition = [Windows.Forms.FormStartPosition]::CenterParent
+    $dlg.BackColor = [Drawing.Color]::White
+    $dlg.TopMost = $true
+    $dlg.Font = New-Object Drawing.Font('Microsoft YaHei UI', 9)
+    try { if ($script:appIcon) { $dlg.Icon = $script:appIcon } } catch { }
+
+    $pic = New-Object Windows.Forms.PictureBox
+    $pic.Location = New-Object Drawing.Point(20, 22)
+    $pic.Size = New-Object Drawing.Size(32, 32)
+    $pic.SizeMode = [Windows.Forms.PictureBoxSizeMode]::CenterImage
+    $pic.Image = [Drawing.SystemIcons]::Warning.ToBitmap()
+    $dlg.Controls.Add($pic)
+
+    $lblHead = New-Object Windows.Forms.Label
+    $lblHead.Location = New-Object Drawing.Point(66, 20)
+    $lblHead.Size = New-Object Drawing.Size(510, 24)
+    $lblHead.Text = '配置没保存，文件保持原样。'
+    $lblHead.Font = New-Object Drawing.Font('Microsoft YaHei UI', 10, [Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($lblHead)
+
+    $lblErr = New-Object Windows.Forms.Label
+    $lblErr.Location = New-Object Drawing.Point(66, 52)
+    $lblErr.Size = New-Object Drawing.Size(510, 60)
+    $lblErr.ForeColor = [Drawing.Color]::FromArgb(198, 30, 30)
+    $lblErr.Font = New-Object Drawing.Font('Microsoft YaHei UI', 9, [Drawing.FontStyle]::Bold)
+    $lblErr.Text = $msg
+    $dlg.Controls.Add($lblErr)
+
+    $lblTail = New-Object Windows.Forms.Label
+    $lblTail.Location = New-Object Drawing.Point(66, 120)
+    $lblTail.Size = New-Object Drawing.Size(510, 56)
+    $lblTail.ForeColor = [Drawing.Color]::FromArgb(90, 90, 90)
+    if ($pos.Line -ge 1) {
+        $lblTail.Text = '「配置内容」页里第 ' + $pos.Line + ' 行已经用红字标出来了，光标也停在那一列；改好后可以再点一次「重启代理」。完整报错在「运行日志」页。'
+    } else {
+        $lblTail.Text = '「配置内容」页底部会用红字给出这条提示；改好后可以再点一次「重启代理」。完整报错在「运行日志」页。'
+    }
+    $dlg.Controls.Add($lblTail)
+
+    $btnOk = New-Object Windows.Forms.Button
+    $btnOk.Text = '确定'
+    $btnOk.Size = New-Object Drawing.Size(96, 30)
+    $btnOk.Location = New-Object Drawing.Point(480, 186)
+    $btnOk.DialogResult = [Windows.Forms.DialogResult]::OK
+    $dlg.Controls.Add($btnOk)
+    $dlg.AcceptButton = $btnOk
+    $dlg.CancelButton = $btnOk
+
+    try {
+        if ($script:form) { [void]$dlg.ShowDialog($script:form) } else { [void]$dlg.ShowDialog() }
+    } finally {
+        $dlg.Dispose()
+    }
+}
+
+function Set-CfgBoxInnerLayout {
+    # 行号栏 + 编辑框按容器当前大小摊开（不靠 Anchor：本机 Anchor 会算错）
+    $panel = $script:panelCfgBox
+    $gut = $script:gutterCfg
+    $box = $script:txtCfg
+    if (-not $panel -or -not $gut -or -not $box) { return }
+    try {
+        $iw = [Math]::Max(160, $panel.ClientSize.Width - 2)
+        $ih = [Math]::Max(80, $panel.ClientSize.Height - 2)
+        $gutW = 46
+        $gut.Location = New-Object Drawing.Point(0, 0)
+        $gut.Size = New-Object Drawing.Size($gutW, $ih)
+        $box.Location = New-Object Drawing.Point($gutW, 0)
+        $box.Size = New-Object Drawing.Size([Math]::Max(60, $iw - $gutW), $ih)
+        $script:gutterSig = ''
+        Update-CfgGutter -Force
+    } catch { }
+}
 
 # --- tab 4：运行日志 ---
 $tabLog = New-Object Windows.Forms.TabPage
@@ -1446,6 +1862,7 @@ XMCP 反代工具.lnk                         首次运行自动生成（X 图�
 XMCP控制台.ps1                            控制台本体
 xterminal-mcp-lan-relay.py                反代（名字沿用历史，逻辑通用）
 start-mcp-relay.ps1 / stop-mcp-relay.ps1  启动 / 停止
+restart-mcp-relay.ps1                     重启（停+启合并到一个进程，省一次冷启动）
 relay-config.ps1 / firewall-sync.ps1      配置解析 / 防火墙同步
 validate-config.py / format-config.py     配置校验 / 自动排版
 mcp-relay.config.json（含 .bak 备份）      配置（可加多条 proxy）
@@ -1465,6 +1882,7 @@ README.md                                 完整文档（含排障记录）
 5. 打包前建议删掉本机的运行时文件，避免把别人的环境信息带出去：
    mcp-relay.config.json（及 .bak）、mcp-relay.log、mcp-relay.pid、
    xmcp-console.log、xmcp-console-status.txt、firewall-state.txt、firewall-fingerprint.txt、
+   firewall-pending.txt、
    「XMCP 反代工具.lnk」。程序会在首次运行时自动重新生成。
 6. 想先静默初始化（不弹窗口、不起反代）：
    powershell -ExecutionPolicy Bypass -File XMCP控制台.ps1 -BootstrapOnly
@@ -1658,9 +2076,26 @@ $btnQuit.add_Click({ Stop-And-Exit })
 
 # 配置内容页：记录是否改过（切 tab 时用来决定要不要重新读文件）
 $txtCfg.add_TextChanged({
+    Update-CfgLineIndex                                          # 行号栏靠这张偏移表，内容一变立刻重建
+    if ($script:cfgErrorLine -gt 0) { Clear-ConfigErrorMark }    # 已经改动了，上一轮的红字位置就不作数了
+    Update-CfgGutter -Force
     if ($script:suppressDirty) { return }
     if ($script:configDirty -ne $true) { $script:configDirty = $true }
 })
+
+# 行号栏和状态行的轻量刷新：不挂滚动/选中事件（自绘和选中会互相触发），
+# 改成 150ms 轮询，只在「配置内容」页可见时跑；签名没变化就什么都不做。
+$script:cfgUiTimer = New-Object Windows.Forms.Timer
+$script:cfgUiTimer.Interval = 150
+$script:cfgUiTimer.add_Tick({
+    try {
+        if (-not $script:form -or -not $script:form.Visible) { return }
+        if (-not $script:tabs -or $script:tabs.SelectedTab -ne $script:tabEdit) { return }
+        Update-CfgGutter
+        Update-CfgCaretStatus
+    } catch { }
+})
+$script:cfgUiTimer.Start()
 
 # 日志页的两个小按钮
 $btnLogRefresh.add_Click({ Update-LogView })
@@ -1719,13 +2154,16 @@ function Update-Layout {
         $script:panelSample.Size = New-Object Drawing.Size(($pw - 12), 72)
         $txtSample.Location = New-Object Drawing.Point(6, 84)
         $txtSample.Size = New-Object Drawing.Size(($pw - 12), ($ph - 92))
-        # 配置内容页
+        # 配置内容页（编辑区 = 行号栏 + 富文本框，底下再留一行状态/报错）
         $script:panelEdit.Location = New-Object Drawing.Point(6, 4)
         $script:panelEdit.Size = New-Object Drawing.Size(($pw - 12), 46)
         $script:lblCfgState.Location = New-Object Drawing.Point(8, 58)
         $btnLoadCfg.Location = New-Object Drawing.Point(($pw - 170), 54)
-        $script:txtCfg.Location = New-Object Drawing.Point(6, 90)
-        $script:txtCfg.Size = New-Object Drawing.Size(($pw - 12), ($ph - 98))
+        $script:panelCfgBox.Location = New-Object Drawing.Point(6, 90)
+        $script:panelCfgBox.Size = New-Object Drawing.Size(($pw - 12), ($ph - 120))
+        $script:lblCfgError.Location = New-Object Drawing.Point(8, ($ph - 26))
+        $script:lblCfgError.Size = New-Object Drawing.Size(($pw - 16), 18)
+        Set-CfgBoxInnerLayout
         # 运行日志页（二级 tab）
         $script:panelLog.Location = New-Object Drawing.Point(6, 4)
         $script:panelLog.Size = New-Object Drawing.Size(($pw - 12), 54)
@@ -1788,6 +2226,7 @@ try {
     [Windows.Forms.Application]::Run($form)
 } finally {
     try { $script:taskTimer.Stop(); $script:taskTimer.Dispose() } catch { }
+    try { $script:cfgUiTimer.Stop(); $script:cfgUiTimer.Dispose() } catch { }
     try { if ($script:bgPs) { $script:bgPs.Dispose() } } catch { }
     try { if ($script:singleton) { $script:singleton.ReleaseMutex(); $script:singleton.Dispose() } } catch { }
     try { $script:ni.Visible = $false; $script:ni.Dispose() } catch { }
