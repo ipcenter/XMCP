@@ -566,8 +566,11 @@ function Invoke-McpPost {
     if ($EnvelopeMeta) { $bodyParams = ($Params + @{ _meta = $EnvelopeMeta }) }
     $bodyObj = [ordered]@{ jsonrpc = '2.0'; id = 1; method = $Method; params = $bodyParams }
     $body = ($bodyObj | ConvertTo-Json -Compress -Depth 6)
-    # -i 带回响应头；-k 忽略自签证书（探针只做诊断，和反代侧 CERT_NONE 一致）；--noproxy 不走系统代理；--max-time 5 防止卡死 UI 等待
-    $raw = & $curl -sS -k -i --noproxy '*' --max-time 5 -X POST $Url @headers -d $body 2>&1 | Out-String
+    # -i 带回响应头；-k 忽略自签证书；--noproxy 不走系统代理；--max-time 5 防止卡死 UI 等待。
+    # 请求体走 stdin（--data-binary @-）：PS 5.1 把含双引号的 JSON 作为原生程序参数传递时会转义错乱，
+    # 上游解析不了报文直接回 40015；走 stdin 可绕开参数引号问题。
+    $curlArgs = @('-sS','-k','-i','--noproxy','*','--max-time','5','-X','POST',$Url) + $headers + @('--data-binary','@-')
+    $raw = ($body | & $curl @curlArgs 2>&1 | Out-String)
     return $raw
 }
 
