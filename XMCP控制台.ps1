@@ -553,8 +553,8 @@ param($Url, $Token)
 $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
 if (-not (Test-Path -LiteralPath $curl)) { $curl = 'curl.exe' }
 
-# 用户可能粘贴成 "Bearer xxx"，这里去掉重复前缀，避免发出 "Bearer Bearer xxx"
-$tok = ($Token -replace '^\s*Bearer\s+', '').Trim()
+# 兼容三种粘贴：裸 Key / "Bearer xxx" / "Authorization: Bearer xxx"，只保留裸令牌
+$tok = ($Token -ireplace '^\s*(Authorization\s*:\s*)?(Bearer\s+)?', '').Trim()
 
 function Invoke-McpPost {
     param($Url, $Tok, $Method, $Version, $Params, $EnvelopeMeta, $McpMethod)
@@ -836,8 +836,8 @@ function Start-Probe {
     if ($script:probeHandle -and -not $script:probeHandle.IsCompleted) { return }
     $url = $script:txtProbeUrl.Text.Trim()
     if (-not $url) { Set-ProbeResult '请先填上游 MCP 地址。'; return }
-    # 去重 Bearer 前缀：用户贴 "Bearer xxx" 和只贴 "xxx" 都按裸令牌处理
-    $token = ($script:txtProbeToken.Text.Trim() -ireplace '^\s*Bearer\s+', '').Trim()
+    # 兼容裸 Key / "Bearer xxx" / "Authorization: Bearer xxx"，只保留裸令牌
+    $token = ($script:txtProbeToken.Text.Trim() -ireplace '^\s*(Authorization\s*:\s*)?(Bearer\s+)?', '').Trim()
     $script:btnProbe.Enabled = $false
     Set-ProbeResult '探测中…（initialize / discover / 会话通道，各最多等 5 秒）'
     $ps = [PowerShell]::Create()
