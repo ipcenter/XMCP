@@ -998,10 +998,30 @@ function Render-ProbeResult {
     $discOk = [bool]($disc.SupportedVersions -or $disc.ResultType)
     $initState = if ($initCode -in @('401', '403')) { 'unknown' } elseif ($initOk) { 'yes' } elseif ($initCode -eq '000') { 'unknown' } else { 'no' }
     $discState = if ($discCode -in @('401', '403')) { 'unknown' } elseif ($discOk) { 'yes' } elseif ($discCode -eq '000') { 'unknown' } else { 'no' }
+    # discover 的错误消息里常带「supported versions: ...」长括号串，挤在一行看不出重点：
+    # 把列表单独拆出来另起一行，主行只留"哪个版本不被支持"。
+    $discErrText = [string]$disc.ErrMsg
+    $discSupported = ''
+    if ($discErrText) {
+        $svm = [regex]::Match($discErrText, '(?i)supported\s+versions?\s*:\s*([^)]+)')
+        if ($svm.Success) {
+            $discSupported = ($svm.Groups[1].Value.Trim() -replace '\s*,\s*', ' / ')
+            $cut = $discErrText.IndexOf('(')
+            if ($cut -ge 0 -and $cut -lt $svm.Index) { $discErrText = $discErrText.Substring(0, $cut) }
+            else { $discErrText = $discErrText.Substring(0, $svm.Index) }
+            $discErrText = $discErrText.Trim()
+        }
+        if ($discErrText -match '(?i)Unsupported protocol version\s*:\s*(\S+)') {
+            $badVer = $Matches[1]
+            $discErrText = $discErrText -replace '(?i)^\s*Bad Request\s*:\s*', ''
+            $discErrText = $discErrText -replace '(?i)Unsupported protocol version\s*:\s*\S+', ('不支持的版本: ' + $badVer)
+        }
+    }
     $initNote = if ($initOk) { 'HTTP ' + $initCode + ' · 协商版本 ' + $init.Version } else { 'HTTP ' + $initCode + $(if ($init.ErrCode) { ' · [' + $init.ErrCode + '] ' + $init.ErrMsg }) }
-    $discNote = if ($discOk) { 'HTTP ' + $discCode + ' · 支持的版本 ' + $disc.SupportedVersions } else { 'HTTP ' + $discCode + $(if ($disc.ErrCode) { ' · [' + $disc.ErrCode + '] ' + $disc.ErrMsg }) }
+    $discNote = if ($discOk) { 'HTTP ' + $discCode + ' · 支持的版本 ' + $disc.SupportedVersions } else { 'HTTP ' + $discCode + $(if ($disc.ErrCode) { ' · [' + $disc.ErrCode + '] ' + $discErrText }) }
     Add-Line ('  [' + (State-Symbol $initState) + '] 2025-11-25 有状态握手（Sessionful）   ' + $initNote) (State-Color $initState)
     Add-Line ('  [' + (State-Symbol $discState) + '] 2026-07-28 无状态（Stateless）      ' + $discNote) (State-Color $discState)
+    if ($discSupported) { Add-Line ('      上游支持的版本: ' + $discSupported) $gray }
     Add-Line ''
 
     # --- 会话能力：会话号 / 通知流 / 会话删除 ---
