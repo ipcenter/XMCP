@@ -50,7 +50,9 @@ foreach ($p in $cfg.Proxies) {
         $url = "http://$h`:$pt/"
         $code = & $curlExe -sS -o NUL -w "%{http_code}" --max-time 8 $url 2>$null
         if (-not $code) { $code = '000' }
-        Write-Host "    http://$h`:$pt/  -> $code"
+        $tag = ''
+        if ($code -match '^5\d\d$') { $tag = '  <上游异常>'; $allOk = $false }
+        Write-Host "    http://$h`:$pt/  -> $code$tag"
         if ($code -eq '000') { $allOk = $false }
     }
 }
@@ -70,8 +72,9 @@ if ($fw) {
 
 Write-Host ""
 Write-Host "判定："
-Write-Host "  探针打的是各地址的根路径 /，只要不是 000 都说明反代已连通并到达上游。"
+Write-Host "  探针打的是各地址的根路径 /：非 000 且非 5xx 说明反代已连通并到达上游。"
 Write-Host "  XTerminal 只暴露 /mcp，所以 / 返回 404 是正常的；/mcp 返回 401 表示缺令牌，也正常。"
 Write-Host "  000/超时    = 不通（反代没跑、端口没监听、或防火墙没放行）"
+Write-Host "  5xx(如502) = 反代在跑但上游没应答（上游没开、target 端口错、或 HTTPS 写成 http）"
 Write-Host "  403 Invalid Host = 没走反代（直连了别的地址，或 rewrite_host 没开）"
 if (-not $allOk) { Write-Host "  => 有地址不通，先看第 5 节的防火墙规则是否包含对应端口。" }

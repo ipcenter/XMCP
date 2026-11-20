@@ -223,6 +223,78 @@ function Test-Endpoint {
     return $code
 }
 
+function Get-HostPort {
+    # 从 "http://192.168.1.20:27123/" 或 target "127.0.0.1:27123/mcp" 里抠出 host 与 port
+    param([string]$Text)
+    $r = @{ Host = ''; Port = '' }
+    if (-not $Text) { return $r }
+    $t = ($Text.Trim() -replace '^\w+://', '')
+    $t = ($t -split '/')[0]
+    if ($t -match '^([^:]+)(?::(\d+))?') {
+        $r.Host = $Matches[1]
+        $r.Port = if ($Matches[2]) { $Matches[2] } else { '80' }
+    }
+    return $r
+}
+
+function Test-PortListening {
+    # 端口/地址是否在 TCP LISTENING；给了 HostName 就按地址精确匹配（通配绑定 0.0.0.0/:: 也算应答）
+    # 只按端口匹配会把"反代自己监听在 192.168.x.x:12335"误当成"上游 127.0.0.1:12335 在监听"
+    param([string]$Port, [string]$NsText, [string]$HostName = '')
+    if (-not $Port -or -not $NsText) { return $false }
+    $rx = [regex]('(?m)^\s*TCP\s+([0-9\.\*\[\]:]+):' + [regex]::Escape([string]$Port) + '\s+[^\s]+\s+LISTENING\s+(\d+)')
+    foreach ($m in $rx.Matches($NsText)) {
+        if (-not $HostName) { return $true }
+        $addr = $m.Groups[1].Value
+        if ($addr -eq $HostName) { return $true }
+        if ($addr -eq '0.0.0.0' -or $addr -eq '::' -or $addr -eq '[::]') { return $true }
+        if ($HostName -eq 'localhost' -and $addr -eq '127.0.0.1') { return $true }
+        if ($HostName -eq '127.0.0.1' -and $addr -eq '::1') { return $true }
+    }
+    return $false
+}
+
+function Get-ConnDiag {
+    # 把一条探测结果翻译成「结论 + 具体原因」，别只给连通/不通两个词
+    param([string]$Code, [string]$Url, [string]$Target, [string]$NsText)
+    $r = @{ Verdict = '连通'; Detail = '' }
+    $u = Get-HostPort $Url
+    $tg = Get-HostPort $Target
+
+    if ($Code -eq '000') {
+        $r.Verdict = '不通'
+        if (-not (Test-PortListening $u.Port $NsText $u.Host)) {
+            $r.Detail = '反代没在 ' + $u.Host + ':' + $u.Port + ' 监听（进程没起、启动失败或已退出）'
+        } else {
+            $r.Detail = $u.Host + ':' + $u.Port + ' 在监听但连不上（连接被拒或被防火墙拦下，跨网段时查防火墙）'
+        }
+        return $r
+    }
+
+    if ($Code -match '^5\d\d$') {
+        $r.Verdict = '上游异常'
+        $localTarget = $tg.Host -in @('127.0.0.1', 'localhost', '::1', '0.0.0.0')
+        if ($localTarget -and -not (Test-PortListening $tg.Port $NsText $tg.Host)) {
+            $r.Detail = '上游 ' + $tg.Host + ':' + $tg.Port + ' 没有监听（上游服务没开或已退出）'
+        } elseif ($localTarget) {
+            $r.Detail = '上游 ' + $tg.Host + ':' + $tg.Port + ' 在监听但不应答（路径不对，或把 http 写到了只开 https 的端口）'
+        } else {
+            $r.Detail = '上游 ' + $tg.Host + ':' + $tg.Port + ' 无法应答（远端服务未开或不互通）'
+        }
+        return $r
+    }
+
+    switch -Regex ($Code) {
+        '^2'  { $r.Detail = '正常应答' }
+        '^3'  { $r.Detail = '已到达上游，返回重定向' }
+        '401' { $r.Detail = '已到达上游，需要令牌（401）' }
+        '403' { $r.Detail = '已到达上游，被拒绝（403：令牌不对，或上游校验 Host 而 rewrite_host 没开）' }
+        '404' { $r.Detail = '已到达上游，路径不存在（404：查 URL 路径与 target 的端口/路径）' }
+        default { if ($Code -match '^4') { $r.Detail = '已到达上游，请求被拒（' + $Code + '）' } else { $r.Detail = '已到达上游（' + $Code + '）' } }
+    }
+    return $r
+}
+
 function Get-StatusText {
 
     $sb = New-Object System.Text.StringBuilder
@@ -315,7 +387,12 @@ function Get-StatusText {
         $ms = $rx.Matches($nsText)
         if ($ms.Count -gt 0) {
             foreach ($m in $ms) {
-                [void]$sb.AppendLine('  TCP    ' + $m.Groups[1].Value + ':' + $port + '   LISTENING   PID ' + $m.Groups[2].Value)
+                $ownerPid = $m.Groups[2].Value
+                # 同一个端口上可能既有反代，也有上游本体（比如 Obsidian 自己监听 127.0.0.1:27123），
+                # 标一下归属，免得把上游监听当成反代在绑地址
+                $note = ''
+                if ($proc -and $ownerPid -ne [string]$proc.Id) { $note = '   （不是反代进程，是同端口的上游/其他程序）' }
+                [void]$sb.AppendLine('  TCP    ' + $m.Groups[1].Value + ':' + $port + '   LISTENING   PID ' + $ownerPid + $note)
             }
         } else {
             [void]$sb.AppendLine('  端口 ' + $port + ' 没有监听')
@@ -325,6 +402,8 @@ function Get-StatusText {
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('[连通性] 自动检测')
     $ok = 0
+    $bad = 0
+    $warn = 0
     $total = 0
     foreach ($p in $cfg.Proxies) {
         for ($i = 0; $i -lt $p.ListenHost.Count; $i++) {
@@ -334,15 +413,24 @@ function Get-StatusText {
             $url = 'http://' + $h + ':' + $pt + '/'
             $total++
             $code = Test-Endpoint -Url $url
-            $verdict = '连通'
-            if ($code -eq '000') { $verdict = '不通' } else { $ok++ }
-            [void]$sb.AppendLine(('  ' + $url).PadRight(38) + ' -> ' + $code + '   ' + $verdict)
+            $diag = Get-ConnDiag -Code $code -Url $url -Target $p.Target -NsText $nsText
+            switch ($diag.Verdict) {
+                '不通'     { $bad++ }
+                '上游异常' { $warn++ }
+                default    { $ok++ }
+            }
+            [void]$sb.AppendLine((('  ' + $url).PadRight(40) + ' -> ' + $code.PadRight(4) + ' ' + $diag.Verdict))
+            if ($diag.Detail) { [void]$sb.AppendLine('        · ' + $diag.Detail) }
         }
     }
-    [void]$sb.AppendLine('  小结: ' + $ok + '/' + $total + ' 个地址可达')
-    [void]$sb.AppendLine('  （000=不通；401/404/200 都算连通——已到达上游，401 只是缺令牌）')
-    $script:lastVerdict = $ok.ToString() + '/' + $total.ToString() + ' 地址可达'
-    # 健康判定：进程在 且 所有配置地址都可达
+    # 小结先报真正通达的条数；异常和不通各自单列，别混成一个"可达"糊过去
+    $sum = '  小结: ' + $ok + '/' + $total + ' 个地址通达'
+    if ($warn -gt 0) { $sum += '，' + $warn + ' 个上游异常' }
+    if ($bad -gt 0) { $sum += '，' + $bad + ' 个不通' }
+    [void]$sb.AppendLine($sum)
+    [void]$sb.AppendLine('  （000=不通；5xx=反代在跑但上游没应答；401/404/200 等=已到达上游；每条的原因见下面缩进行）')
+    $script:lastVerdict = $ok.ToString() + '/' + $total.ToString() + ' 地址通达'
+    # 健康判定：进程在 且 所有配置地址都真正通达（5xx 不算通达，上游其实已经挂了）
     $script:healthy = [bool]($proc -ne $null -and $total -gt 0 -and $ok -eq $total)
 
     [void]$sb.AppendLine('')
@@ -404,11 +492,14 @@ function Set-StatusText {
             $box.SelectionFont = New-Object Drawing.Font('Consolas', 9)
             $box.SelectionColor = [Drawing.Color]::Black
             $box.Select(0, 0)
-            $rx = [regex]"(连通|不通)(?=\r\n|\r|\n|$)"
+            $rx = [regex]"(上游异常|连通|不通)(?=\r\n|\r|\n|$)"
             foreach ($m in $rx.Matches($box.Text)) {
-                $box.Select($m.Index, 2)
-                if ($m.Groups[1].Value -eq '连通') { $box.SelectionColor = [Drawing.Color]::FromArgb(0, 100, 0) }
-                else { $box.SelectionColor = [Drawing.Color]::FromArgb(200, 0, 0) }
+                $box.Select($m.Index, $m.Length)
+                switch ($m.Groups[1].Value) {
+                    '连通'     { $box.SelectionColor = [Drawing.Color]::FromArgb(0, 100, 0) }
+                    '上游异常' { $box.SelectionColor = [Drawing.Color]::FromArgb(192, 110, 0) }
+                    default    { $box.SelectionColor = [Drawing.Color]::FromArgb(200, 0, 0) }
+                }
             }
             # 代理名字行尾的 [Host改写]：蓝色、小一号，当提示看，不抢地址那几行的视线
             $rxTag = [regex]'\[Host改写\]'
@@ -687,6 +778,8 @@ function Get-ProbeVerdict {
     param($InitCode, $Init, $DiscCode, $Disc)
     if ($InitCode -in @('401', '403') -or $DiscCode -in @('401', '403')) { return 'auth' }
     if ($InitCode -eq '000' -and $DiscCode -eq '000') { return 'unreachable' }
+    # 5xx：探针打的是反代入口时，说明反代在跑但上游没应答，和"不确定"分开报
+    if ($InitCode -match '^5\d\d$' -or $DiscCode -match '^5\d\d$') { return 'upstreambad' }
     $initOk = [bool]$Init.Version
     $discOk = [bool]($Disc.SupportedVersions -or $Disc.ResultType)
     if ($initOk -and $discOk) { return 'dual' }
@@ -825,8 +918,21 @@ function Render-ProbeResult {
             $conclColor = $orange
         }
         'unreachable' {
-            $concl = '结论: 连不上。检查地址、端口与上游是否在跑；经反代访问时也要确认监听地址可达。'
+            # 连不上时把"具体卡在哪"写清楚：端口有没有监听、是不是被拦
+            $hp = Get-HostPort $url
+            $nsNow = ''
+            try { $nsNow = (& $netstatExe -ano | Out-String) } catch { $nsNow = '' }
+            $where = $hp.Host + ':' + $hp.Port
+            if (-not (Test-PortListening $hp.Port $nsNow $hp.Host)) {
+                $concl = '结论: 连不上（HTTP 000）。' + $where + ' 本机没有监听——上游服务没开或已退出，先把它启动。'
+            } else {
+                $concl = '结论: 连不上（HTTP 000）。' + $where + ' 有监听但连接没建立——检查是否被防火墙拦下、地址/端口是否写错，或把 http 打到了只开 https 的端口。'
+            }
             $conclColor = $red
+        }
+        'upstreambad' {
+            $concl = '结论: 反代在跑但上游没应答（5xx）。检查上游服务是否已启动，以及 target 的端口与协议（http/https）是否写对。'
+            $conclColor = $orange
         }
         default {
             $concl = '结论: 不确定。两条腿都没返回标准 JSON-RPC 结果，可能不是 MCP 端点，或报文结构与预期不同，看上面各行原始错误。'
@@ -2247,7 +2353,8 @@ XMCP 局域网反代工具 · 使用说明
 
 五、怎么用（三步）
 1. 双击「XMCP 反代工具」快捷方式或「XMCP控制台.bat」。
-   程序会自动拉起反代并自检，状态页出现 2/2 地址可达、healthy=True 即正常。
+   程序会自动拉起反代并自检，状态页 [连通性] 全为「连通」、healthy=True 即正常；
+   出现「上游异常」说明反代在跑但上游没应答，缩进行会写出具体卡在哪。
 2. 客户端（虚拟机 / 另一台电脑）里访问 http://192.168.110.1:12335/mcp（带令牌），
    或按对应软件的地址格式填 192.168.110.1:12335。
 3. 要再转发一个服务：在「配置内容」页的 proxies 数组里加一段，例如
@@ -2264,10 +2371,11 @@ XMCP 局域网反代工具 · 使用说明
 六、几个容易踩的点
 · rewrite_host 只在服务端校验 Host 时才设 true（XTerminal 必须 true，否则 403）；
   如果上游是普通 Web 服务、按 Host 分发站点，乱改反而会 404 / 400，那就设 false。
-· 401 / 404 / 200 都算「连通」：401 缺令牌、404 路径不对，都说明已到达上游；000 才是不通。
+· 401 / 404 / 200 都算「连通」：401 缺令牌、404 路径不对，都说明已到达上游；000 才是「不通」。
+· 5xx（常见 502）单列「上游异常」：说明反代在跑、但上游没应答（没开、端口写错、只开 HTTPS 却写了 http）。
+  它不算通达，也别当成服务正常；这时探针直连上游同样会报 000「连不上」，两边说的是同一件事。
 · 上游只开 HTTPS 时，target 要写 https://127.0.0.1:端口。漏写协议前缀的表现是：日志里
-  UPSTREAM FAIL ... Remote end closed connection without response，客户端拿到 502。502 也是
-  「连通」——它证明反代在跑，但上游没应答，别当成服务正常。
+  UPSTREAM FAIL ... Remote end closed connection without response，客户端拿到 502。
 · 配置支持 # 注释：# 到行尾整段忽略，字符串里的 # 不算注释；数组最后一项留逗号也不报错。
 · 反代不会开机自启：需要时双击控制台。点「1.最小化」收托盘后反代仍在跑，双击托盘图标可再打开。
 · 换端口要同步改客户端：防火墙按 listen 自动推导，客户端里填的端口要自己改。
