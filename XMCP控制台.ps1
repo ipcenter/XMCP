@@ -671,7 +671,7 @@ function Start-RelayTask {
 }
 
 # ===== MCP 探针 =====
-# 后台任务：旧规范 initialize（有状态握手）、新规范 server/discover（无状态）各打一发，
+# 后台任务：按 2025-11-25 规范发 initialize、按 2026-07-28 规范发 server/discover 各打一发，
 # 有会话号再探 GET 通知流与 DELETE 会话；只做探测、不改报文，解析和结论判定放回 UI 线程。
 $script:probeTaskCode = @'
 param($Url, $Token, $HostVariant)
@@ -765,7 +765,7 @@ $initParams = @{
     capabilities    = @{}
     clientInfo      = @{ name = 'xmcp-probe'; version = '1.0' }
 }
-# 2026-07-28 无状态规范：信封 _meta 放在 params 内，键是扁平的 io.modelcontextprotocol/* 路径
+# 2026-07-28 规范：信封 _meta 放在 params 内，键是扁平的 io.modelcontextprotocol/* 路径
 $meta = [ordered]@{
     'io.modelcontextprotocol/protocolVersion'  = '2026-07-28'
     'io.modelcontextprotocol/clientInfo'       = @{ name = 'xmcp-probe'; version = '1.0' }
@@ -778,7 +778,7 @@ $discRaw = Invoke-McpPost -Url $u -Tok $tok -Method 'server/discover' -Version '
 $init = Split-Response $initRaw
 $disc = Split-Response $discRaw
 
-# 新规范这一发是按 2026-07-28（无状态）打的，不带会话号。
+# 新规范这一发按 2026-07-28 打的，不带会话号。
 # 只支持旧规范的服务端会直接挑"缺少会话"拒掉；这时用它自己的会话号再打一发，
 # 只用于排除"只是缺会话才被拒"的干扰；带旧会话号不是新规范的正确姿势，
 # 这一发结果不作为新协议兼容判定依据。拿到的 -32601 Method not found 可佐证"未实现 server/discover"。
@@ -1054,11 +1054,11 @@ function Render-ProbeResult {
     $termColor = [Drawing.Color]::FromArgb(0, 90, 200)
     $termFont = New-Object Drawing.Font($rt.Font.FontFamily, $rt.Font.Size, [Drawing.FontStyle]::Bold)
     $terms = @(
-        '会话号（Mcp-Session-Id）', '有状态握手（Sessionful）', '无状态（Stateless）',
+        '会话号（Mcp-Session-Id）', '旧规范 initialize 握手', '新规范 server/discover',
         '通知流（GET 长连接）', '关闭会话（DELETE）',
         '工具（Tools）', '资源（Resources）', '提示（Prompts）',
-        '有状态（Sessionful）', '基线 / 变体', '上游支持的版本', '上游不支持的版本',
-        'server/discover', 'Mcp-Session-Id', 'initialize', 'capabilities', 'rewrite_host'
+        '有状态（Sessionful）', '无状态（Stateless）', '基线 / 变体', '上游支持的版本', '上游不支持的版本',
+        'server/discover', 'Mcp-Session-Id', 'initialize', 'capabilities', 'rewrite_host', '协议版本'
     )
     function Add-Line {
         param([string]$Text, $Color = $black, [bool]$Strong = $false)
@@ -1148,8 +1148,8 @@ function Render-ProbeResult {
     $discCodeIsNum = [bool]($disc.ErrCode -match '^-?\d+$')
     $discErrCore = if ($discOk) { '' } else { Format-ProbeErr $disc.ErrCode $discErrText }
     $discNote = if ($discOk) { 'HTTP ' + $discCode + ' · 支持的版本 ' + $disc.SupportedVersions } else { 'HTTP ' + $discCode + $(if ($discCodeIsNum) { ' · [' + $disc.ErrCode + ']' } else { '' }) + $(if ($discErrCore) { ' · ' + $discErrCore } else { '' }) }
-    Add-Line ('  [' + (State-Symbol $initState) + '] 2025-11-25 有状态握手（Sessionful）   ' + $initNote) (State-Color $initState)
-    Add-Line ('  [' + (State-Symbol $discState) + '] 2026-07-28 无状态（Stateless）      ' + $discNote.TrimEnd()) (State-Color $discState)
+    Add-Line ('  [' + (State-Symbol $initState) + '] 2025-11-25 旧规范 initialize 握手   ' + $initNote) (State-Color $initState)
+    Add-Line ('  [' + (State-Symbol $discState) + '] 2026-07-28 新规范 server/discover  ' + $discNote.TrimEnd()) (State-Color $discState)
     if ($discSupported) { Add-Line (' 上游支持的版本: ' + $discSupported) $gray }
     if ($discBadVer) { Add-Line (' 上游不支持的版本: ' + $discBadVer) $gray }
     if ($disc.ErrCode -and -not $discCodeIsNum) { Add-Line (' 上游错误码: ' + $disc.ErrCode) $gray }
@@ -1171,12 +1171,19 @@ function Render-ProbeResult {
 
     # --- 会话能力：会话号 / 通知流 / 会话删除 ---
     Add-Line '会话能力' $black $true
-    $sidState = if ($initSession) { 'yes' } elseif ($initCode -in @('401', '403', '000')) { 'unknown' } else { 'no' }
-    Add-Line ('  [' + (State-Symbol $sidState) + '] 会话号（Mcp-Session-Id）  ' + $(if ($initSession) { $initSession } else { '响应头里没带' })) (State-Color $sidState)
+    # 会话号是可选的：旧规范也允许服务端不分配。没带回不算"不支持"，标中性未分配。
+    $sidState = if ($initSession) { 'yes' } elseif ($initCode -in @('401', '403', '000')) { 'unknown' } else { 'na' }
+    if ($initSession) {
+        Add-Line ('  [' + (State-Symbol $sidState) + '] 会话号（Mcp-Session-Id）  ' + $initSession) (State-Color $sidState)
+    } else {
+        Add-Line ('  [' + (State-Symbol $sidState) + '] 会话号（Mcp-Session-Id）  服务端未分配会话号') (State-Color $sidState)
+        Add-Line '     采用无协议级会话模式；会话号可选，不违反规范。' $gray
+    }
     $getState = Get-CheckState $getCode '200'
-    $delState = Get-CheckState $delCode '200,202,204'
+    # 没有会话号时 DELETE 不适用；通知流是可选传输能力，未打通只标未验证
+    if (-not $initSession) { $delState = 'na'; $delText = '无会话号，不适用' } else { $delState = Get-CheckState $delCode '200,202,204'; $delText = 'HTTP ' + $delCode }
     Add-Line ('  [' + (State-Symbol $getState) + '] 通知流（GET 长连接）      HTTP ' + $getCode) (State-Color $getState)
-    Add-Line ('  [' + (State-Symbol $delState) + '] 关闭会话（DELETE）        HTTP ' + $delCode) (State-Color $delState)
+    Add-Line ('  [' + (State-Symbol $delState) + '] 关闭会话（DELETE）        ' + $delText) (State-Color $delState)
     Add-Line ''
 
     # --- 服务端能力：两条腿上报的 capabilities 取并集 ---
@@ -1228,7 +1235,10 @@ function Render-ProbeResult {
         }
         switch ($hostState) {
             'must' {
-                Add-Line ('  判定: 必须开启 rewrite_host —— 换成外部 Host 就被拒（HTTP ' + $line['VAR_HTTP'] + '），只有本机名能访问') $red
+                Add-Line ('  判定: 必须开启 rewrite_host —— 外部 Host 被拒（HTTP ' + $line['VAR_HTTP'] + '），仅基线 Host 可访问') $red
+                Add-Line ('     基线通过的 Host：' + $baseText + '，改写目标应取这个 Host。') $gray
+                Add-Line ('     本次只直连上游比对了两种 Host；反代改写后是否真正生效，') $gray
+                Add-Line '     需经反代实际发一次请求验证。' $gray
             }
             'free' {
                 Add-Line '  判定: 未发现上游存在 Host 白名单限制' $green
@@ -1257,16 +1267,18 @@ function Render-ProbeResult {
     $concl = ''; $conclColor = $gray
     switch ($verdict) {
         'dual' {
-            $concl = '结论: 新旧两套协议都支持（有状态 + 无状态），同规范客户端一般可直连。'
+            $concl = '结论: 新旧两套协议版本都支持，同规范客户端一般可直连。'
             $conclColor = $green
         }
         'old' {
-            $concl = '结论: 仅旧规范（有状态握手，' + $init.Version + '）。' + "`r`n" +
-                     '  按 2026-07-28 无状态规范来的客户端，需要桥接层做握手与会话适配。'
+            $sessionWord = if ($initSession) { '初始化带回了会话号' } else { '未分配会话号' }
+            $concl = '结论: 仅支持 ' + $init.Version + ' 协议版本（' + $sessionWord + '）。' + "`r`n" +
+                     '  按 2026-07-28 版本来的客户端，需要桥接层做协议版本适配；' + "`r`n" +
+                     '  是否需要会话号转换不能预设，后续请求能否直接调用要实际调用验证。'
             $conclColor = $orange
         }
         'new' {
-            $concl = '结论: 仅新规范（2026-07-28 无状态）。旧规范客户端需要桥接。'
+            $concl = '结论: 仅支持 2026-07-28 协议版本。旧规范客户端需要桥接。'
             $conclColor = $green
         }
         'auth' {
@@ -1300,16 +1312,14 @@ function Render-ProbeResult {
 
     # --- 名词解释：上面这些英文术语到底指什么 ---
     Add-Line '名词解释' $black $true
-    Add-Line '  · 有状态（Sessionful）：旧规范 2025-11-25 的做法。客户端先 initialize 握手，' $black
-    Add-Line '    服务端可回一个会话号，后续请求都带着它续上下文。' $black
-    Add-Line '  · 无状态（Stateless）：新规范 2026-07-28 的做法。不使用协议级 Session，' $black
-    Add-Line '    不需要旧式 initialize 握手；请求通过协议规定的元数据携带版本等信息，' $black
-    Add-Line '    可使用 server/discover 查询服务端支持的版本与能力。' $black
-    Add-Line '  · initialize：旧规范的握手请求，协商版本，顺带拿到会话号。' $black
+    Add-Line '  · 有状态（Sessionful）：传输模式选择。服务端回会话号，后续请求带着它续上下文。' $black
+    Add-Line '  · 无状态（Stateless）：传输模式选择。不使用协议级 Session，请求不带会话号。' $black
+    Add-Line '    会话模式与协议版本是两个维度：旧规范 2025-11-25 也可以不分配会话号，' $black
+    Add-Line '    新规范 2026-07-28 取消协议级会话；不能单凭有无会话号判断版本。' $black
+    Add-Line '  · initialize：旧规范的握手请求，协商版本；是否回会话号由服务端决定（可选）。' $black
     Add-Line '  · server/discover：新规范的能力发现请求，回支持的版本与 capabilities。' $black
     Add-Line '  · 会话号（Mcp-Session-Id）：旧版 Streamable HTTP 中，服务端可通过响应头' $black
-    Add-Line '    分配会话标识；若分配了，客户端后续请求需携带它。旧版协议允许不使用会话号，' $black
-    Add-Line '    不能单凭有无会话号判断协议版本。' $black
+    Add-Line '    分配会话标识；若分配了，客户端后续请求需携带它。旧版协议允许不使用会话号。' $black
     Add-Line '  · 通知流（GET 长连接）：服务端主动往下推事件的通道；' $black
     Add-Line '    不提供也不影响调用，工具照样能一条条 POST 调。HTTP 200 只说明端点应答，' $black
     Add-Line '    未校验连接保持与事件推送。' $black
@@ -2848,7 +2858,7 @@ XMCP 反代工具
 
 功能一览
 · 多代理并存：一份 JSON 挂任意多组「监听地址 -> 上游」，各自独立启停，互不影响；
-· Host 改写：rewrite_host 把 Host 头改成上游的 host:port，专治只认 127.0.0.1 的本地服务 403；
+· Host 改写：rewrite_host 把 Host 头改成上游的 host:port，适用于上游校验 Host、只认本机名而回 403 的场景；
 · 状态自检：进程 / 监听 / 连通性 / 防火墙四段，段与段之间用横线隔开，一眼看出是哪一类信息；
 · 三档连通性：000 不通（红）、5xx 上游异常（橙，不计通达）、其余已到达上游（绿），
   小结行单独报「几个通达、几个上游异常、几个不通」，不再拿 502 冒充可达；
