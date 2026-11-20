@@ -1035,6 +1035,10 @@ function Render-ProbeResult {
     Add-Line ('目标: ' + $url)
     Add-Line ('探测时间: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
     Add-Line ('鉴权: ' + $(if ($line['TOKEN_PRESENT'] -eq 'yes') { '已带令牌' } else { '未填令牌（上游若要 Bearer，结果会是 401）' }))
+    # 服务端自报的家门放最顶上，先看清在对谁做探测
+    $server = $init.ServerName; $serverVer = $init.ServerVer
+    if (-not $server) { $server = $disc.ServerName; $serverVer = $disc.ServerVer }
+    if ($server) { Add-Line (('探测服务端：' + $server + ' ' + $serverVer).TrimEnd()) }
     Add-Line ''
 
     # --- 协议兼容性：两条腿分别按真实响应判定 ---
@@ -1089,11 +1093,6 @@ function Render-ProbeResult {
     $prom  = $init.Prompts -or $disc.Prompts
     $capState = { param($b) if ($b) { 'yes' } else { 'no' } }
     Add-Line ('  [' + (State-Symbol (& $capState $tools)) + '] 工具（Tools）   [' + (State-Symbol (& $capState $res)) + '] 资源（Resources）   [' + (State-Symbol (& $capState $prom)) + '] 提示（Prompts）') $black
-    Add-Line ''
-
-    $server = $init.ServerName; $serverVer = $init.ServerVer
-    if (-not $server) { $server = $disc.ServerName; $serverVer = $disc.ServerVer }
-    if ($server) { Add-Line ('服务端: ' + $server + ' ' + $serverVer) }
     Add-Line ''
 
     # --- Host 校验：同一上游、同一报文，只把 Host 头换成外部地址再打一发 ---
