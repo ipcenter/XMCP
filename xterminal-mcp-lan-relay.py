@@ -399,7 +399,11 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                 pass
             elif chunked_to_client:
                 while True:
-                    data = response.read(4096)
+                    # 必须用 read1：read(4096) 对 chunked 流会一直凑满 4096 字节才返回，
+                    # 像 subscriptions/listen 这种先回一个小 ack 帧、再挂起等事件的 SSE 长流，
+                    # 首帧会卡在内部缓冲区发不出去，客户端收不到任何字节而超时。
+                    # read1 只取当前可读的一块就返回，读到多少转多少。
+                    data = response.read1(4096)
                     if not data:
                         break
                     self.wfile.write(b"%x\r\n" % len(data))
