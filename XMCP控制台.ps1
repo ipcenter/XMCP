@@ -2709,6 +2709,7 @@ $txtLogGuide.ScrollBars = [Windows.Forms.ScrollBars]::Vertical
 $txtLogGuide.WordWrap = $true
 $txtLogGuide.Font = New-Object Drawing.Font('Microsoft YaHei UI', 9)
 $txtLogGuide.BackColor = [Drawing.Color]::White
+$txtLogGuide.BorderStyle = [Windows.Forms.BorderStyle]::None
 $txtLogGuide.Dock = [Windows.Forms.DockStyle]::Fill
 $guideText = @'
 链路日志 · 口径详解（mcp-relay-trace.log）
@@ -2781,7 +2782,17 @@ UNKNOWN_ERROR         未归类异常，需结合「反代日志」页的具体�
 原始记录见「链路日志」页；详细报错堆栈见「反代日志」页。
 '@
 $txtLogGuide.Text = (To-Crlf $guideText)
-$logPageGuide.Controls.Add($txtLogGuide)
+
+# 参照「使用说明」：外层带边框 Panel 留内边距，内层 TextBox 无边框铺满，文字不贴边框
+$panelGuide = New-Object Windows.Forms.Panel
+$panelGuide.BorderStyle = [Windows.Forms.BorderStyle]::FixedSingle
+$panelGuide.BackColor = [Drawing.Color]::White
+$panelGuide.Padding = New-Object Windows.Forms.Padding(10, 8, 10, 8)
+$panelGuide.Location = New-Object Drawing.Point(6, 6)
+$panelGuide.Size = New-Object Drawing.Size(620, 340)
+$panelGuide.Controls.Add($txtLogGuide)
+$logPageGuide.Controls.Add($panelGuide)
+$script:panelGuide = $panelGuide
 $script:txtLogGuide = $txtLogGuide
 
 $tabLog.Controls.Add($logTabs)
@@ -3116,7 +3127,11 @@ $btnSelCopy.add_Click({
             '关于软件' { $box = $script:txtAbout }
             '运行日志' {
                 if ($script:logTabs -and $script:logTabs.SelectedTab) {
-                    $box = $script:logTabs.SelectedTab.Controls[0]
+                    if ($script:logTabs.SelectedTab.Text -eq '日志详解') {
+                        $box = $script:txtLogGuide
+                    } else {
+                        $box = $script:logTabs.SelectedTab.Controls[0]
+                    }
                 }
             }
         }
@@ -3342,6 +3357,10 @@ function Update-Layout {
         $script:panelHelp.Size = New-Object Drawing.Size(($pw - 12), ($ph - 12))
         $script:panelAbout.Location = New-Object Drawing.Point(6, 6)
         $script:panelAbout.Size = New-Object Drawing.Size(($pw - 12), ($ph - 12))
+        if ($script:panelGuide) {
+            $script:panelGuide.Location = New-Object Drawing.Point(6, 6)
+            $script:panelGuide.Size = New-Object Drawing.Size(($pw - 12), ($ph - 12))
+        }
         # 底部按钮：三个主按钮等宽等距对齐，右侧固定「全选复制」90x30
         $gap = 8
         $btnW = [int][Math]::Floor((($w - 24 - 90 - 10 - (2 * $gap)) / 3))
