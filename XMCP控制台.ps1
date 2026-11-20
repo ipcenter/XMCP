@@ -2620,7 +2620,7 @@ $tabHelp.Controls.Add($panelHelp)
 $script:panelHelp = $panelHelp
 $script:txtHelp = $txtHelp
 
-# --- tab 6：关于软件 ---
+# --- tab 7：关于软件 ---
 $tabAbout = New-Object Windows.Forms.TabPage
 $tabAbout.Text = '关于软件'
 $tabAbout.Padding = New-Object Windows.Forms.Padding(3)
@@ -2639,7 +2639,7 @@ $txtAbout.Dock = [Windows.Forms.DockStyle]::Fill
 $txtAbout.Text = @'
 XMCP 反代工具
 
-版本号      1.0.0（2026-11-18）
+版本号      1.1.0（2026-11-20）
 作者        极客盟工具开发组
 问题反馈    联系微信 xywaykie
 
@@ -2647,22 +2647,45 @@ XMCP 反代工具
 运行依赖    Windows PowerShell 5.1 + Python 3（自动探测：常见安装目录或系统 PATH 均可）
 安装方式    绿色版、免安装：解压即用，整个目录可随意拷贝，不写注册表、不改系统设置
 
-界面技术    PowerShell + WinForms，单窗口六页：状态 / 配置格式 / 配置内容 / 运行日志 / 使用说明 / 关于软件
+界面技术    PowerShell + WinForms，单窗口七页：
+            状态 / 配置格式 / 配置内容 / 运行日志 / MCP探针 / 使用说明 / 关于软件
 反代实现    Python 标准库（socket + threading），不依赖任何第三方包
+上游支持    target 可写 http:// 或 https://；https 给只开加密端口的服务，不校验自签证书，对外仍明文
 防火墙      按配置自动生成「精确放行 + 补集拦截」规则组 XMCP relay，需管理员权限时弹一次 UAC
+
+功能一览
+· 多代理并存：一份 JSON 挂任意多组「监听地址 -> 上游」，各自独立启停，互不影响；
+· Host 改写：rewrite_host 把 Host 头改成上游的 host:port，专治只认 127.0.0.1 的本地服务 403；
+· 状态自检：进程 / 监听 / 连通性 / 防火墙四段，段与段之间用横线隔开，一眼看出是哪一类信息；
+· 三档连通性：000 不通（红）、5xx 上游异常（橙，不计通达）、其余已到达上游（绿），
+  小结行单独报「几个通达、几个上游异常、几个不通」，不再拿 502 冒充可达；
+· 原因写清楚：每条结果下面再给一行具体原因——上游没监听、在监听但不应答、防火墙拦下、
+  HTTPS 目标握不上、令牌缺失，以及 rewrite_host 的实况（已是 true 就不再劝你改）；
+· MCP 探针：填上游本体地址 + 可选令牌，按旧规范 initialize、新规范 server/discover 各打一发，
+  握出会话号再探 GET 通知流与 DELETE 会话，输出兼容性矩阵（双协议 / 仅旧 / 仅新 / 需要鉴权 / 连不上）；
+· Host 校验：探针额外打一发只换 Host 头的变体，与基线对比，判定这条链路是否必须开 rewrite_host；
+· 配置编辑：内置编辑器 + 行列定位校验 + 一键格式化（每键一行、2 空格缩进），保存前先验证并留 .bak；
+· 双日志分栏：控制台日志与反代日志分开看，最新一条永远在最上面；
+· 托盘常驻：最小化到右下角，双击图标还原；关窗口不杀反代，反代掉线再还原会自动拉起；
+· 一键复制：底部「全选复制」按当前页取内容，状态、报告、配置都能直接贴出去排查。
 
 程序特点
 · 不改第三方程序文件：XTerminal 的 asar 一行没动；
 · 配置外置：监听地址、上游、超时、日志大小全部写在 JSON 里，改配置不改代码；
-· 启动即自检：自动拉起反代、自动比对防火墙、自动测连通性，状态页给结论；
-· 双日志分栏：控制台日志与反代日志分开看，最新一条永远在最上面；
+· 启动即自检：自动拉起反代、自动比对防火墙、自动测连通性，状态页直接给结论；
 · 出错有话说：格式错误定位到行列，配置不会被写坏，旧文件留 .bak。
+
+同目录脚本（命令行也能用）
+· start / stop / restart-mcp-relay.ps1     反代启停
+· check-mcp-relay.ps1                      不开界面也能跑一遍自检
+· validate-config.py / format-config.py    配置校验与格式化
+· firewall-sync.ps1                        同步防火墙规则（需管理员）
 
 许可与声明
 本程序为内部自用工具，请勿把配置文件里的内网地址、端口与令牌对外传播。
 本程序只做端口转发与 Host 改写，不采集、不上传任何数据。
 
-文档        README.md（在程序目录下，含完整部署说明与排障记录）
+文档        README.md（在程序目录下，含完整部署说明、探针用法与排障记录）
 '@
 
 $panelAbout = New-Object Windows.Forms.Panel
@@ -2675,6 +2698,8 @@ $panelAbout.Controls.Add($txtAbout)
 $tabAbout.Controls.Add($panelAbout)
 $script:panelAbout = $panelAbout
 $script:txtAbout = $txtAbout
+# 多行文本框只认 CRLF：LF-only 会把整段挤成一行，这里强制归一（源文件是 CRLF 时等于不变）
+$txtAbout.Text = (($txtAbout.Text -replace "`r`n", "`n") -replace "`n", "`r`n")
 
 
 # ================= 底部操作按钮（只留三个）=================
