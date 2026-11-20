@@ -1,5 +1,5 @@
 ﻿# XMCP 反代控制台 —— 单窗口，取代原来的三个 bat
-# 用法：双击桌面「XMCP 反代工具」快捷方式（直连 powershell 隐藏启动）；命令行排障可直接跑 XMCP控制台.bat
+# 用法：双击桌面「XMCP 反代工具」快捷方式（由 XMCP.Relay.exe 启动器隐藏拉起本脚本）；命令行排障可直接跑 XMCP控制台.bat
 # 行为：读 mcp-relay.config.json -> 自动启动/检测连通性 -> 按钮随状态变化
 #       通：按钮显示 "1. 最小化（缩到右下角托盘）"，点一下立即缩托盘，零等待
 #       不通：按钮置灰不可点，必须先点 "重启代理"（= 停一次 + 起一次 + 防火墙同步）
@@ -35,6 +35,8 @@ $sys32     = Join-Path $env:SystemRoot 'System32'
 $curlExe   = Join-Path $sys32 'curl.exe'
 $netstatExe = Join-Path $sys32 'netstat.exe'
 $psExe     = Join-Path $sys32 'WindowsPowerShell\v1.0\powershell.exe'
+# 原生启动器 exe（内嵌 xmcp.ico）：快捷方式/任务栏固定项指向它，图标与分组才不回退到 powershell 默认图标。
+$launcherExe = Join-Path $root 'XMCP.Relay.exe'
 
 # 隐藏宿主控制台黑窗：控制台进程仍在（托盘、后台探测/启停任务都靠它），只是窗口不显示。
 # 快捷方式直连 powershell.exe、不经 cmd/bat；这里再 P/Invoke 把控制台窗口藏掉作双保险。
@@ -62,10 +64,18 @@ function Write-LocalShortcut {
         if (-not (Test-Path -LiteralPath $ps1)) { return }
         $ico = Join-Path $root 'xmcp.ico'
         $s = (New-Object -ComObject WScript.Shell).CreateShortcut($LnkPath)
-        $s.TargetPath = $psExe
-        $s.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ps1 + '"'
+        if (Test-Path -LiteralPath $launcherExe) {
+            # 首选原生启动器：图标内嵌在 exe 里，任务栏固定项认 exe 身份，不回退 powershell 图标。
+            $s.TargetPath = $launcherExe
+            $s.Arguments = ''
+            $s.IconLocation = $launcherExe + ',0'
+        } else {
+            # 兜底：启动器缺失时直连 powershell 隐藏启动。
+            $s.TargetPath = $psExe
+            $s.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ps1 + '"'
+            if (Test-Path -LiteralPath $ico) { $s.IconLocation = $ico + ',0' }
+        }
         $s.WorkingDirectory = $root
-        if (Test-Path -LiteralPath $ico) { $s.IconLocation = $ico + ',0' }
         $s.Description = 'XMCP 反代工具'
         $s.WindowStyle = 7
         $s.Save()
@@ -77,12 +87,19 @@ function Repair-Shortcut {
     try {
         $ps1 = Join-Path $root 'XMCP控制台.ps1'
         if (-not (Test-Path -LiteralPath $ps1)) { return }
+        # 期望目标：优先启动器 exe；exe 缺失才回退 powershell 直连。
+        $wantTarget = if (Test-Path -LiteralPath $launcherExe) { $launcherExe } else { $psExe }
+        function Test-ShortcutOk($sc) {
+            if ($sc.TargetPath -ne $wantTarget) { return $false }
+            if ($wantTarget -eq $psExe) { return ($sc.Arguments -like ('*' + $ps1 + '*')) }
+            return $true
+        }
         # 目录里那份：没有就建，有但指错就重写
         $local = Join-Path $root 'XMCP 反代工具.lnk'
         $okLocal = $false
         if (Test-Path -LiteralPath $local) {
             $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($local)
-            $okLocal = ($sc.TargetPath -eq $psExe) -and ($sc.Arguments -like ('*' + $ps1 + '*'))
+            $okLocal = Test-ShortcutOk $sc
         }
         if (-not $okLocal) { Write-LocalShortcut -LnkPath $local -Label 'local' }
         # 桌面那份：只修正已存在的，不擅自往桌面新建
@@ -91,7 +108,7 @@ function Repair-Shortcut {
             $lnk = Join-Path $desktop 'XMCP 反代工具.lnk'
             if (Test-Path -LiteralPath $lnk) {
                 $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-                $okDesktop = ($sc.TargetPath -eq $psExe) -and ($sc.Arguments -like ('*' + $ps1 + '*'))
+                $okDesktop = Test-ShortcutOk $sc
                 if (-not $okDesktop) { Write-LocalShortcut -LnkPath $lnk -Label 'desktop' }
             }
         }
@@ -2774,6 +2791,8 @@ UNKNOWN_ERROR         未归类异常，需结合「反代日志」页的具体�
 
 五、常见场景速查
 - 401：auth=missing 或上游判定凭证无效；先核对连接器的鉴权头与 Token。
+
+
 - 502 / UPSTREAM_DISCONNECTED：上游没开、端口不对，或 HTTPS / HTTP 写反。
 - 长流挂起无数据：idle=yes 是静默；first_up_ms=- 表示上游首字节都没到。
 - 客户端掉了：reason=CLIENT_DISCONNECTED，多为连接器超时或主动取消。

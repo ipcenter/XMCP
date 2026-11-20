@@ -39,9 +39,9 @@ XMCP 就是补上这一层：**对外监听一个局域网地址和端口 → �
 ## 快速开始
 
 1. 装好 **Python 3**（程序会自动在常见目录与 `PATH` 里找 `pythonw` / `python`）。
-2. 双击桌面「XMCP 反代工具」快捷方式（直连 `powershell.exe` 隐藏拉起，不经 cmd 启动层；脚本启动后会再把宿主控制台窗口藏掉，不弹黑窗）。首次运行会自动完成：
+2. 双击桌面「XMCP 反代工具」快捷方式（由原生启动器 `XMCP.Relay.exe` 隐藏拉起控制台脚本，不经 cmd 启动层；脚本启动后再把宿主控制台窗口藏掉，不弹黑窗）。首次运行会自动完成：
    - 生成 `mcp-relay.config.json`（监听地址取本机网卡 IPv4，网段取同段 `/24`）；
-   - 生成目录内的「XMCP 反代工具.lnk」（黄底黑 X 图标）；
+   - 生成目录内的「XMCP 反代工具.lnk」（指向启动器 exe，X 图标内嵌在 exe 内，任务栏固定项不会回退成 PowerShell 默认图标）；
    - 启动反代、比对防火墙（首次会弹一次 UAC，允许即可）。
 3. 在控制台「配置内容」页把 `target` 改成你的服务真实端口，点「保存并重启」，看状态页连通性。
 
@@ -198,6 +198,8 @@ powershell -ExecutionPolicy Bypass -File ".\check-mcp-relay.ps1"     # 只做连
 ```
 XMCP控制台.bat            命令行排障入口（经一层 cmd，会带控制台窗口）
 XMCP控制台.ps1            窗口控制台（界面 + 配置校验 + 启停调度）
+XMCP.Relay.exe            原生启动器（内嵌 xmcp.ico，任务栏/固定项宿主，拉起上面的 ps1）
+XMCP.Relay.Launcher.cs    启动器 C# 源码（改动后用 csc 重新编译出 exe）
 xterminal-mcp-lan-relay.py 反代主体（纯标准库，名字沿用首版场景，逻辑通用）
 relay-config.ps1          配置解析（支持 # 注释、尾逗号）
 start/stop/check-mcp-relay.ps1  命令行入口
