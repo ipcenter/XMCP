@@ -3,6 +3,8 @@ mcp-relay.config.json
 mcp-relay.config.json.bak
 mcp-relay.config.json.tmp
 mcp-relay.log
+mcp-relay-trace.log
+mcp-relay-debug.log
 mcp-relay.pid
 xmcp-console.log
 xmcp-console-status.txt

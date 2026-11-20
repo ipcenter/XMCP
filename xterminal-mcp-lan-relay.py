@@ -42,6 +42,7 @@ import ssl
 import sys
 import threading
 import time
+import uuid
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("XT_MCP_RELAY_CONFIG") or os.path.join(
@@ -185,6 +186,122 @@ def log(msg):
         pass
 
 
+# ---- 链路诊断日志（独立文件，只记可观测性信息，不记凭证与报文正文）----
+_TRACE_PATH = os.path.join(SCRIPT_DIR, "mcp-relay-trace.log")
+_TRACE_MAX_BYTES = 5 * 1024 * 1024
+
+# 结束原因枚举：区分客户端断开 / 上游断开 / 超时 / 下游写失败 / 正常关闭等
+REASON_CLIENT_DISCONNECTED = "CLIENT_DISCONNECTED"
+REASON_UPSTREAM_DISCONNECTED = "UPSTREAM_DISCONNECTED"
+REASON_CONNECT_TIMEOUT = "CONNECT_TIMEOUT"
+REASON_RESPONSE_TIMEOUT = "RESPONSE_TIMEOUT"
+REASON_IDLE_TIMEOUT = "IDLE_TIMEOUT"
+REASON_STREAM_PARSE_ERROR = "STREAM_PARSE_ERROR"
+REASON_DOWNSTREAM_WRITE_ERROR = "DOWNSTREAM_WRITE_ERROR"
+REASON_NORMAL_CLOSE = "NORMAL_CLOSE"
+REASON_UNKNOWN_ERROR = "UNKNOWN_ERROR"
+
+
+def _trace_write(line):
+    """写链路日志；写失败绝不能阻塞 MCP 数据转发。"""
+    try:
+        if os.path.exists(_TRACE_PATH) and os.path.getsize(_TRACE_PATH) > _TRACE_MAX_BYTES:
+            os.replace(_TRACE_PATH, _TRACE_PATH + ".1")
+        with open(_TRACE_PATH, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
+
+def _tv(value):
+    """字段值格式化：含空白/逗号就包引号，避免一行被拆乱。"""
+    s = str(value)
+    if any(ch in s for ch in (" ", ",", "=", ";")):
+        return '"%s"' % s.replace('"', "'")
+    return s
+
+
+def _ms(ts, t0):
+    if not ts:
+        return "-"
+    return "%.0f" % ((ts - t0) * 1000)
+
+
+class Trace:
+    """单次客户端请求的链路上下文：trace_id 贯穿接入、上游、下游交付、结束全过程。"""
+
+    def __init__(self, proxy_name, client_addr, method, path, headers):
+        self.trace_id = uuid.uuid4().hex[:12]
+        self.proxy = proxy_name
+        self.client = client_addr
+        self.method = method
+        self.path = path
+        self.t0 = time.time()
+        self.first_upstream_byte = None
+        self.first_downstream_write = None
+        self.first_sse_event = None
+        self.last_activity = self.t0
+        self.upstream_bytes = 0
+        self.downstream_bytes = 0
+        self.sse = False
+        self.end_reason = REASON_UNKNOWN_ERROR
+        # 请求头按大小写不敏感读取；凭证只记有无，不记真实值
+        hd = {k.lower(): v for k, v in headers.items()}
+        self.content_type = hd.get("content-type", "")
+        self.accept = hd.get("accept", "")
+        self.protocol_version = hd.get("mcp-protocol-version", "")
+        self.has_session = "yes" if hd.get("mcp-session-id") else "no"
+        self.auth = "present" if hd.get("authorization") else "missing"
+        self._sse_tail = ""
+
+    def _stamp(self):
+        return time.strftime("%Y-%m-%d %H:%M:%S") + ".%03d" % int((time.time() % 1) * 1000)
+
+    def event(self, kind, **fields):
+        parts = ["trace=%s" % self.trace_id, "event=%s" % kind]
+        for key, val in fields.items():
+            if val is None or val == "":
+                continue
+            parts.append("%s=%s" % (key, _tv(val)))
+        _trace_write("%s %s\n" % (self._stamp(), " ".join(parts)))
+
+    def touch(self):
+        self.last_activity = time.time()
+
+    def mark_upstream_bytes(self, n):
+        self.upstream_bytes += n
+        if self.first_upstream_byte is None and n > 0:
+            self.first_upstream_byte = time.time()
+
+    def mark_downstream_bytes(self, n):
+        self.downstream_bytes += n
+        if self.first_downstream_write is None and n > 0:
+            self.first_downstream_write = time.time()
+
+    def detect_sse_event(self, chunk):
+        """在转发字节流里识别一个完整 SSE 事件结束（空行分隔）。
+
+        注意：按字节流里的空行判断，不把 HTTP chunk 边界当作事件边界。
+        """
+        if not self.sse or self.first_sse_event is not None:
+            return
+        self._sse_tail = (self._sse_tail + chunk.decode("utf-8", "replace"))[-4096:]
+        if "\n\n" in self._sse_tail or "\r\n\r\n" in self._sse_tail:
+            self.first_sse_event = time.time()
+
+    def finish(self, reason):
+        self.end_reason = reason
+        idle = "yes" if (self.sse and self.first_sse_event is None) else "no"
+        self.event("END", reason=reason, up_bytes=self.upstream_bytes,
+                  down_bytes=self.downstream_bytes,
+                  dur_ms="%.0f" % ((time.time() - self.t0) * 1000),
+                  first_up_ms=_ms(self.first_upstream_byte, self.t0),
+                  first_down_ms=_ms(self.first_downstream_write, self.t0),
+                  first_event_ms=_ms(self.first_sse_event, self.t0),
+                  last_active_ms=_ms(self.last_activity, self.t0),
+                  backpressure="n/a", idle=idle)
+
+
 def parse_addr(text, field):
     """把 'host:port' 解析成 (host, port)。"""
     if not isinstance(text, str) or ":" not in text:
@@ -322,6 +439,7 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         cfg = self.PROXY
         method = self.command
         path = self.path
+        tr = Trace(cfg["name"], self.client_address[0], method, path, self.headers)
 
         # ---- 1. 读客户端请求体 ----
         body = None
@@ -335,6 +453,12 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                 body = self.rfile.read(declared_length)
             else:
                 declared_length = 0
+
+        # 接入日志：只记头与有无凭证，不记 Token / Session 真值 / 报文正文
+        tr.event("CONNECT", proxy=cfg["name"], client=self.client_address[0],
+                 method=method, path=path, ctype=tr.content_type, accept=tr.accept,
+                 proto=tr.protocol_version, session=tr.has_session, auth=tr.auth,
+                 req_bytes=declared_length)
 
         # ---- 2. 构造上游请求头（关键：Host 改写）----
         headers = {}
@@ -356,11 +480,31 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                                                context=SSL_CONTEXT)
         else:
             conn = http.client.HTTPConnection(target_host, target_port, timeout=cfg["timeout"])
+        connect_t0 = time.time()
         try:
             conn.request(method, path, body=body, headers=headers)
             response = conn.getresponse()
+        except socket.timeout as exc:
+            log("UPSTREAM TIMEOUT [%s] %s %s -> %s" % (cfg["name"], method, path, exc))
+            tr.finish(REASON_RESPONSE_TIMEOUT)
+            payload = ('{"jsonrpc":"2.0","error":{"code":-32099,'
+                       '"message":"relay upstream timeout: %s"},"id":null}' % exc).encode("utf-8")
+            self.send_response_only(502, "Bad Gateway")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(payload)
+                self.wfile.flush()
+            except Exception:
+                pass
+            conn.close()
+            self.close_connection = True
+            return
         except Exception as exc:  # noqa: BLE001
             log("UPSTREAM FAIL [%s] %s %s -> %s" % (cfg["name"], method, path, exc))
+            tr.finish(REASON_UPSTREAM_DISCONNECTED)
             payload = ('{"jsonrpc":"2.0","error":{"code":-32099,'
                        '"message":"relay upstream unavailable: %s"},"id":null}' % exc).encode("utf-8")
             self.send_response_only(502, "Bad Gateway")
@@ -376,6 +520,17 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             conn.close()
             self.close_connection = True
             return
+
+        # 上游响应日志：识别 SSE 流（200 + text/event-stream 只代表流已建立，不等于收到首帧）
+        resp_ctype = response.getheader("Content-Type", "")
+        resp_te = response.getheader("Transfer-Encoding", "")
+        resp_cl = response.getheader("Content-Length", "")
+        if "text/event-stream" in resp_ctype.lower():
+            tr.sse = True
+        tr.event("UPSTREAM", upstream="%s:%s" % (target_host, target_port),
+                 connect_status="ok", status=response.status, ctype=resp_ctype,
+                 te=resp_te or "-", cl=resp_cl or "-",
+                 up_connect_ms="%.0f" % ((time.time() - connect_t0) * 1000))
 
         # ---- 4. 回写状态行与响应头 ----
         self.send_response_only(response.status, response.reason)
@@ -394,6 +549,7 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
 
         # ---- 5. 透传响应体（支持 SSE 流式）----
         chunked_to_client = upstream_length is None
+        end_reason = REASON_NORMAL_CLOSE
         try:
             if method == "HEAD" or response.status in (204, 304):
                 pass
@@ -406,10 +562,14 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                     data = response.read1(4096)
                     if not data:
                         break
+                    tr.mark_upstream_bytes(len(data))
+                    tr.detect_sse_event(data)
+                    tr.touch()
                     self.wfile.write(b"%x\r\n" % len(data))
                     self.wfile.write(data)
                     self.wfile.write(b"\r\n")
                     self.wfile.flush()
+                    tr.mark_downstream_bytes(len(data))
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
             else:
@@ -419,13 +579,28 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                     if not data:
                         break
                     remaining -= len(data)
+                    tr.mark_upstream_bytes(len(data))
+                    tr.detect_sse_event(data)
+                    tr.touch()
                     self.wfile.write(data)
+                    tr.mark_downstream_bytes(len(data))
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, socket.timeout) as exc:
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            # 下游主动断开（对端关闭了连接）
+            end_reason = REASON_CLIENT_DISCONNECTED
             log("CLIENT DROP [%s] %s %s -> %s" % (cfg["name"], method, path, exc))
+        except socket.timeout as exc:
+            # 长流静默等到超时：记 IDLE，不按业务错误处理
+            end_reason = REASON_IDLE_TIMEOUT
+            log("STREAM IDLE TIMEOUT [%s] %s %s -> %s" % (cfg["name"], method, path, exc))
+        except OSError as exc:
+            end_reason = REASON_DOWNSTREAM_WRITE_ERROR
+            log("DOWNSTREAM WRITE ERROR [%s] %s %s -> %s" % (cfg["name"], method, path, exc))
         except Exception as exc:  # noqa: BLE001
+            end_reason = REASON_UNKNOWN_ERROR
             log("RELAY BODY ERROR [%s] %s %s -> %s" % (cfg["name"], method, path, exc))
         finally:
+            tr.finish(end_reason)
             try:
                 response.close()
             except Exception:

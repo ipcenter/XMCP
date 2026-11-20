@@ -19,6 +19,7 @@ $startPs1 = Join-Path $root 'start-mcp-relay.ps1'
 $stopPs1  = Join-Path $root 'stop-mcp-relay.ps1'
 $restartPs1 = Join-Path $root 'restart-mcp-relay.ps1'
 $uiLog    = Join-Path $root 'xmcp-console.log'
+$traceLog = Join-Path $root 'mcp-relay-trace.log'
 $uiSnap   = Join-Path $root 'xmcp-console-status.txt'
 $pywExe   = 'C:\Python314\pythonw.exe'
 if (-not (Test-Path -LiteralPath $pywExe)) {
@@ -1621,6 +1622,7 @@ function Update-LogView {
     $relayLog = Join-Path $root 'mcp-relay.log'
     $rxRelay  = '^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\s(.*)$'
     $rxUi     = '^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\]\s?(.*)$'
+    $rxTrace  = '^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?:\.\d{3})?\s(.*)$'
 
     if ($script:txtLogRelay) {
         $arr = @(Get-LogTailItems -Path $relayLog -Rx $rxRelay)
@@ -1633,6 +1635,12 @@ function Update-LogView {
         $script:txtLogUi.Text = (Format-LogItems -Items $arr -Head '（最新在最上 · 控制台 xmcp-console.log · 最多 60 条）')
         $script:txtLogUi.SelectionStart = 0
         $script:txtLogUi.ScrollToCaret()
+    }
+    if ($script:txtLogTrace) {
+        $arr = @(Get-LogTailItems -Path $traceLog -Rx $rxTrace)
+        $script:txtLogTrace.Text = (Format-LogItems -Items $arr -Head '（最新在最上 · 链路 mcp-relay-trace.log · 按 trace_id 贯穿接入/上游/交付/结束 · 最多 60 条）')
+        $script:txtLogTrace.SelectionStart = 0
+        $script:txtLogTrace.ScrollToCaret()
     }
 }
 
@@ -2594,7 +2602,13 @@ $btnLogOpenUi.Location = New-Object Drawing.Point(274, 330)
 $btnLogOpenUi.Size = New-Object Drawing.Size(176, 26)
 $tabLog.Controls.Add($btnLogOpenUi)
 
-# 二级 tab：控制台日志 / 反代日志，各占一个只读文本框
+$btnLogOpenTrace = New-Object Windows.Forms.Button
+$btnLogOpenTrace.Text = '打开链路日志'
+$btnLogOpenTrace.Location = New-Object Drawing.Point(456, 330)
+$btnLogOpenTrace.Size = New-Object Drawing.Size(156, 26)
+$tabLog.Controls.Add($btnLogOpenTrace)
+
+# 二级 tab：控制台日志 / 反代日志 / 链路日志，各占一个只读文本框
 $logTabs = New-Object Windows.Forms.TabControl
 $logTabs.Location = New-Object Drawing.Point(6, 38)
 $logTabs.Size = New-Object Drawing.Size(620, 286)
@@ -2656,6 +2670,22 @@ $txtLogRelay.BackColor = [Drawing.Color]::White
 $txtLogRelay.Dock = [Windows.Forms.DockStyle]::Fill
 $logPageRelay.Controls.Add($txtLogRelay)
 $script:txtLogRelay = $txtLogRelay
+
+$logPageTrace = New-Object Windows.Forms.TabPage
+$logPageTrace.Text = '链路日志'
+$logPageTrace.Padding = New-Object Windows.Forms.Padding(4)
+[void]$logTabs.TabPages.Add($logPageTrace)
+
+$txtLogTrace = New-Object Windows.Forms.TextBox
+$txtLogTrace.Multiline = $true
+$txtLogTrace.ReadOnly = $true
+$txtLogTrace.ScrollBars = [Windows.Forms.ScrollBars]::Both
+$txtLogTrace.WordWrap = $false
+$txtLogTrace.Font = New-Object Drawing.Font('Consolas', 9)
+$txtLogTrace.BackColor = [Drawing.Color]::White
+$txtLogTrace.Dock = [Windows.Forms.DockStyle]::Fill
+$logPageTrace.Controls.Add($txtLogTrace)
+$script:txtLogTrace = $txtLogTrace
 
 $tabLog.Controls.Add($logTabs)
 $script:logTabs = $logTabs
@@ -2823,6 +2853,7 @@ relay-config.ps1 / firewall-sync.ps1      配置解析 / 防火墙同步
 validate-config.py / format-config.py     配置校验 / 自动排版
 mcp-relay.config.json（含 .bak 备份）      配置（可加多条 proxy）
 mcp-relay.log / xmcp-console.log          反代日志 / 控制台日志
+mcp-relay-trace.log                       链路诊断日志（按 trace_id 贯穿接入/上游/交付/结束）
 xmcp.ico                                  图标
 README.md                                 完整文档（含排障记录）
 
@@ -2836,7 +2867,7 @@ README.md                                 完整文档（含排障记录）
 4. 上游服务（例如 XTerminal 的 MCP）没装或没开时，连通性会显示 000 不通——这是正常的，
    装好上游、把 target 改成它实际监听的 127.0.0.1 端口即可。
 5. 打包前建议删掉本机的运行时文件，避免把别人的环境信息带出去：
-   mcp-relay.config.json（及 .bak）、mcp-relay.log、mcp-relay.pid、
+   mcp-relay.config.json（及 .bak）、mcp-relay.log、mcp-relay-trace.log、mcp-relay.pid、
    xmcp-console.log、xmcp-console-status.txt、firewall-state.txt、firewall-fingerprint.txt、
    firewall-pending.txt、
    「XMCP 反代工具.lnk」。程序会在首次运行时自动重新生成。
@@ -3083,6 +3114,7 @@ $script:cfgUiTimer.Start()
 $btnLogRefresh.add_Click({ Update-LogView })
 $btnLogOpen.add_Click({ Open-LogFile -Path (Join-Path $root 'mcp-relay.log') })
 $btnLogOpenUi.add_Click({ Open-LogFile -Path $uiLog })
+$btnLogOpenTrace.add_Click({ Open-LogFile -Path $traceLog })
 
 # 切换 tab：进"配置内容"且没改动 → 重新读文件；进"运行日志" → 刷新日志
 $tabs.add_SelectedIndexChanged({
@@ -3176,6 +3208,7 @@ function Update-Layout {
         $btnLogRefresh.Location = New-Object Drawing.Point(6, ($ph - 32))
         $btnLogOpen.Location = New-Object Drawing.Point(108, ($ph - 32))
         $btnLogOpenUi.Location = New-Object Drawing.Point(274, ($ph - 32))
+        $btnLogOpenTrace.Location = New-Object Drawing.Point(456, ($ph - 32))
         # MCP 探针页（说明框 + 地址一行 + 令牌/按钮一行 + 结果框）
         # 说明框高度按文字实际排版算，不写死：窗口拉宽后文字行数变少，框也跟着变矮，
         # 底下不留一片空白；下面的地址行/令牌行/结果框都相对框底往下排。

@@ -30,7 +30,7 @@ XMCP 就是补上这一层：**对外监听一个局域网地址和端口 → �
 | 多代理 | 一个配置里可放多组 `listen → target`，一个 listen 可写多个地址 |
 | Host 改写 | `rewrite_host: true` 时把 Host 头改写成上游的 host:port，用于解决 403 Invalid Host 这类 Host 校验 |
 | 防火墙自适应 | 启动时按配置自动建「放行监听端口 + 屏蔽其余端口」规则，无差异则跳过 |
-| 窗口控制台 | 状态 / 配置格式 / 配置内容 / 运行日志（控制台 + 反代双日志）/ 使用说明 / 关于 |
+| 窗口控制台 | 状态 / 配置格式 / 配置内容 / 运行日志（控制台 + 反代 + 链路三日志）/ 使用说明 / 关于 |
 | 首次运行自举 | 没有配置文件就按本机网卡自动生成；自动生成带图标的快捷方式 |
 | 绿色免安装 | 全部路径用脚本自身目录推导，换盘、换机器都不用改配置 |
 
@@ -130,7 +130,7 @@ powershell -ExecutionPolicy Bypass -File ".\check-mcp-relay.ps1"     # 只做连
 - **状态**：配置文件路径、生效的代理、进程 PID、监听端口、连通性（深绿「连通」/ 橙「上游异常」/ 红「不通」，每条下面再给一行具体原因）、防火墙规则快照。各段之间用一条横线隔开，同一段里多条代理之间也用横线分组。
 - **配置格式**：带注释说明的样板，可直接抄。
 - **配置内容**：内置编辑器 + 校验 + 格式化（每个键一行、2 空格缩进），保存前先验证。
-- **运行日志**：二级 tab 分「控制台日志」（启停、配置读写、状态变化）与「反代日志」（每个请求的转发结果）。
+- **运行日志**：二级 tab 分「控制台日志」（启停、配置读写、状态变化）、「反代日志」（每个请求的转发结果）与「链路日志」（按 `trace_id` 贯穿单次请求的接入 → 上游 → 下游交付 → 结束全过程，用于区分客户端断开、上游连不上、响应透传失败、SSE 长流静默；只记头与有无凭证，不记 Token / Session 真值 / 报文正文）。
 - **MCP探针**：地址**必须填上游本体地址**（服务自己监听的那个，如 `http://127.0.0.1:端口/mcp`），不要填反代对你的监听地址——那层 Host 已被改写，探测结果会被门面掩盖。填好点「开始探测」：按 2025-11-25 规范发 `initialize`、按 2026-07-28 规范发能力发现请求（`server/discover`）各发一发；握出会话号后再探 GET 通知流与 DELETE 会话；最后**再打一发只换 `Host` 头的变体**，用它与基线的差异判断上游是否存在 Host 限制、是否需要改写 `rewrite_host`。报告按真实响应给出兼容性矩阵：协议版本与 `server/discover` 方法可用性分开陈述、会话能力（会话号 / GET 流 / DELETE 会话）、服务端能力（Tools / Resources / Prompts，取自初始化响应的 capabilities 声明，未逐条实际调用 `tools/list` 等验证）、Host 校验（存在限制 / 未发现限制 / 无法判定），结论分双协议 / 仅旧 / 仅新 / 需要鉴权 / 连不上 / 不确定。报告开头紧跟鉴权行写一条「探测服务端：名称 版本」，一眼看清在对谁做探测。只做探测，不改报文。
 
   Host 校验怎么读：
@@ -210,7 +210,7 @@ mcp-relay.config.example.json  配置样例
 重建快捷方式.bat          手动重建桌面快捷方式
 ```
 
-运行时产物（首次运行自动生成，不要提交）：`mcp-relay.config.json`、`mcp-relay.log`、`mcp-relay.pid`、`xmcp-console.log`、`xmcp-console-status.txt`、`firewall-state.txt`、`firewall-fingerprint.txt`、`firewall-pending.txt`、`*.lnk`。
+运行时产物（首次运行自动生成，不要提交）：`mcp-relay.config.json`、`mcp-relay.log`、`mcp-relay-trace.log`、`mcp-relay.pid`、`xmcp-console.log`、`xmcp-console-status.txt`、`firewall-state.txt`、`firewall-fingerprint.txt`、`firewall-pending.txt`、`*.lnk`。
 
 ---
 
