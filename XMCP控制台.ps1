@@ -980,16 +980,28 @@ function Render-ProbeResult {
     $termFont = New-Object Drawing.Font($rt.Font.FontFamily, $rt.Font.Size, [Drawing.FontStyle]::Bold)
     $terms = @(
         '会话号（Mcp-Session-Id）', '有状态握手（Sessionful）', '无状态（Stateless）',
-        '通知流（GET 长连接）', '关闭会话（DELETE）', '服务端能力（capabilities 声明）',
+        '通知流（GET 长连接）', '关闭会话（DELETE）',
         '工具（Tools）', '资源（Resources）', '提示（Prompts）',
-        '有状态（Sessionful）', '基线 / 变体', '上游支持的版本', '不支持的版本',
+        '有状态（Sessionful）', '基线 / 变体', '上游支持的版本', '上游不支持的版本',
         'server/discover', 'Mcp-Session-Id', 'initialize', 'capabilities', 'rewrite_host'
     )
     function Add-Line {
-        param([string]$Text, $Color = $black)
+        param([string]$Text, $Color = $black, [bool]$Strong = $false)
         $lineStart = $rt.TextLength
         $rt.SelectionColor = $Color
         $rt.AppendText($Text + "`r`n")
+        if ($Strong) {
+            # 节标题：黑色加粗，整行不参与术语高亮
+            if ($Text) {
+                $rt.Select($lineStart, $Text.Length)
+                $rt.SelectionFont = $termFont
+                $rt.SelectionColor = $black
+            }
+            $rt.Select($rt.TextLength, 0)
+            $rt.SelectionColor = $Color
+            $rt.SelectionFont = $rt.Font
+            return
+        }
         if ($Text) {
             $spans = @()
             foreach ($t in ($terms | Sort-Object -Property @{ Expression = { $_.Length } } -Descending)) {
@@ -1026,7 +1038,7 @@ function Render-ProbeResult {
     Add-Line ''
 
     # --- 协议兼容性：两条腿分别按真实响应判定 ---
-    Add-Line '协议兼容性' $black
+    Add-Line '协议兼容性' $black $true
     $initOk = [bool]$init.Version
     $discOk = [bool]($disc.SupportedVersions -or $disc.ResultType)
     $initState = if ($initCode -in @('401', '403')) { 'unknown' } elseif ($initOk) { 'yes' } elseif ($initCode -eq '000') { 'unknown' } else { 'no' }
@@ -1035,6 +1047,7 @@ function Render-ProbeResult {
     # 把列表单独拆出来另起一行，主行只留"哪个版本不被支持"。
     $discErrText = [string]$disc.ErrMsg
     $discSupported = ''
+    $discBadVer = ''
     if ($discErrText) {
         $svm = [regex]::Match($discErrText, '(?i)supported\s+versions?\s*:\s*([^)]+)')
         if ($svm.Success) {
@@ -1044,21 +1057,23 @@ function Render-ProbeResult {
             else { $discErrText = $discErrText.Substring(0, $svm.Index) }
             $discErrText = $discErrText.Trim()
         }
-        if ($discErrText -match '(?i)Unsupported protocol version\s*:\s*(\S+)') {
-            $badVer = $Matches[1]
+        $bvm = [regex]::Match($discErrText, '(?i)Unsupported protocol version\s*:\s*(\S+)')
+        if ($bvm.Success) {
+            $discBadVer = $bvm.Groups[1].Value
             $discErrText = $discErrText -replace '(?i)^\s*Bad Request\s*:\s*', ''
-            $discErrText = $discErrText -replace '(?i)Unsupported protocol version\s*:\s*\S+', ('不支持的版本: ' + $badVer)
+            $discErrText = ($discErrText -replace '(?i)Unsupported protocol version\s*:\s*\S+', '').Trim()
         }
     }
     $initNote = if ($initOk) { 'HTTP ' + $initCode + ' · 协商版本 ' + $init.Version } else { 'HTTP ' + $initCode + $(if ($init.ErrCode) { ' · [' + $init.ErrCode + '] ' + $init.ErrMsg }) }
-    $discNote = if ($discOk) { 'HTTP ' + $discCode + ' · 支持的版本 ' + $disc.SupportedVersions } else { 'HTTP ' + $discCode + $(if ($disc.ErrCode) { ' · [' + $disc.ErrCode + '] ' + $discErrText }) }
+    $discNote = if ($discOk) { 'HTTP ' + $discCode + ' · 支持的版本 ' + $disc.SupportedVersions } else { 'HTTP ' + $discCode + $(if ($disc.ErrCode) { ' · [' + $disc.ErrCode + ']' + $(if ($discErrText) { ' ' + $discErrText }) }) }
     Add-Line ('  [' + (State-Symbol $initState) + '] 2025-11-25 有状态握手（Sessionful）   ' + $initNote) (State-Color $initState)
-    Add-Line ('  [' + (State-Symbol $discState) + '] 2026-07-28 无状态（Stateless）      ' + $discNote) (State-Color $discState)
-    if ($discSupported) { Add-Line ('      上游支持的版本: ' + $discSupported) $gray }
+    Add-Line ('  [' + (State-Symbol $discState) + '] 2026-07-28 无状态（Stateless）      ' + $discNote.TrimEnd()) (State-Color $discState)
+    if ($discSupported) { Add-Line (' 上游支持的版本: ' + $discSupported) $gray }
+    if ($discBadVer) { Add-Line (' 上游不支持的版本: ' + $discBadVer) $gray }
     Add-Line ''
 
     # --- 会话能力：会话号 / 通知流 / 会话删除 ---
-    Add-Line '会话能力' $black
+    Add-Line '会话能力' $black $true
     $sidState = if ($initSession) { 'yes' } elseif ($initCode -in @('401', '403', '000')) { 'unknown' } else { 'no' }
     Add-Line ('  [' + (State-Symbol $sidState) + '] 会话号（Mcp-Session-Id）  ' + $(if ($initSession) { $initSession } else { '响应头里没带' })) (State-Color $sidState)
     $getState = Get-CheckState $getCode '200'
@@ -1068,7 +1083,7 @@ function Render-ProbeResult {
     Add-Line ''
 
     # --- 服务端能力：两条腿上报的 capabilities 取并集 ---
-    Add-Line '服务端能力（capabilities 声明）' $black
+    Add-Line '服务端能力（capabilities 声明）' $black $true
     $tools = $init.Tools -or $disc.Tools
     $res   = $init.Resources -or $disc.Resources
     $prom  = $init.Prompts -or $disc.Prompts
@@ -1082,7 +1097,7 @@ function Render-ProbeResult {
     Add-Line ''
 
     # --- Host 校验：同一上游、同一报文，只把 Host 头换成外部地址再打一发 ---
-    Add-Line 'Host 校验（上游是否只认本机 Host）' $black
+    Add-Line 'Host 校验（上游是否只认本机 Host）' $black $true
     $hv = $script:probeHostInfo
     if (-not $hv) { $hv = @{ Variant = ''; Note = ''; Skip = ''; Suggest = ''; ProxyName = ''; Current = $null } }
     $baseHost = Get-HostPort $url
@@ -1187,7 +1202,7 @@ function Render-ProbeResult {
     Add-Line ''
 
     # --- 名词解释：上面这些英文术语到底指什么 ---
-    Add-Line '名词解释' $black
+    Add-Line '名词解释' $black $true
     Add-Line '  · 有状态（Sessionful）：旧规范 2025-11-25 的做法。客户端先 initialize 握手，' $black
     Add-Line '    服务端回一个会话号，后续请求都带着它续上下文。' $black
     Add-Line '  · 无状态（Stateless）：新规范 2026-07-28 的做法。不建会话、不发会话号，' $black
