@@ -666,11 +666,12 @@ if (-not (Test-Path -LiteralPath $curl)) { $curl = 'curl.exe' }
 $tok = ($Token -ireplace '^\s*(Authorization\s*:\s*)?(Bearer\s+)?', '').Trim()
 
 function Invoke-McpPost {
-    param($Url, $Tok, $Method, $Version, $Params, $EnvelopeMeta, $McpMethod, $HostOverride)
+    param($Url, $Tok, $Method, $Version, $Params, $EnvelopeMeta, $McpMethod, $HostOverride, $Session)
     $headers = @('-H', 'Content-Type: application/json', '-H', 'Accept: application/json, text/event-stream')
     if ($Tok)   { $headers += @('-H', ('Authorization: Bearer ' + $Tok)) }
     if ($Version) { $headers += @('-H', ('MCP-Protocol-Version: ' + $Version)) }
     if ($McpMethod) { $headers += @('-H', ('Mcp-Method: ' + $McpMethod)) }
+    if ($Session) { $headers += @('-H', ('Mcp-Session-Id: ' + $Session)) }
     # 只覆盖 Host 头：curl 明确支持 -H 'Host: x' 覆盖自动生成的 Host（--http1.1 保证不会落到 :authority）
     if ($HostOverride) { $headers += @('-H', ('Host: ' + $HostOverride)) }
     $bodyParams = $Params
@@ -739,6 +740,16 @@ $discRaw = Invoke-McpPost -Url $u -Tok $tok -Method 'server/discover' -Version '
 $init = Split-Response $initRaw
 $disc = Split-Response $discRaw
 
+# 新规范这一发是按 2026-07-28（无状态）打的，不带会话号。
+# 只支持旧规范的服务端会直接挑"缺少会话"拒掉；这时用它自己的会话号再打一发，
+# 拿到的 -32601 Method not found 才是"未实现 server/discover"的确凿证据。
+$disc2Code = ''; $disc2Body = ''
+if ($init.Session -and $disc.Code -notmatch '^2') {
+    $disc2Raw = Split-Response (Invoke-McpPost -Url $u -Tok $tok -Method 'server/discover' -Version '2026-07-28' -Params @{} -EnvelopeMeta $meta -McpMethod 'server/discover' -Session $init.Session)
+    $disc2Code = $disc2Raw.Code
+    $disc2Body = $disc2Raw.Body
+}
+
 # 只有旧规范握出了会话号，才去探通知流与会话删除；新规范无会话，不探
 $getCode = '–'; $delCode = '–'
 if ($init.Session) {
@@ -767,6 +778,8 @@ $out += ('INIT_SESSION=' + $init.Session)
 $out += ('INIT_BODY=' + $init.Body)
 $out += ('DISC_HTTP=' + $disc.Code)
 $out += ('DISC_BODY=' + $disc.Body)
+$out += ('DISC2_HTTP=' + $disc2Code)
+$out += ('DISC2_BODY=' + $disc2Body)
 $out += ('GET_HTTP=' + $getCode)
 $out += ('DEL_HTTP=' + $delCode)
 $out += ('HOST_VARIANT=' + $(if ($HostVariant) { $HostVariant } else { '' }))
@@ -786,7 +799,16 @@ function Parse-ProbeBody {
     }
     if (-not $Body) { return $r }
     try { $j = $Body | ConvertFrom-Json } catch { return $r }
-    if ($j.error) { $r.ErrCode = [string]$j.error.code; $r.ErrMsg = [string]$j.error.message }
+    if ($j.error) {
+        # 两种错误体都收：JSON-RPC 的 error 对象，以及部分服务端的 {"error":"文本","code":"XXX"} 扁平体
+        if ($j.error -is [string]) {
+            $r.ErrMsg = [string]$j.error
+            if ($j.code) { $r.ErrCode = [string]$j.code }
+        } else {
+            $r.ErrCode = [string]$j.error.code
+            $r.ErrMsg = [string]$j.error.message
+        }
+    }
     if ($j.result) {
         $res = $j.result
         if ($res.protocolVersion)   { $r.Version = [string]$res.protocolVersion }
@@ -806,6 +828,18 @@ function Parse-ProbeBody {
         }
     }
     return $r
+}
+
+function Format-ProbeErr {
+    # 上游的英文报错换成人话；认不出来的原样保留并截断，保证一行放得下。
+    # 只出句子，错误码由调用方另起一行显示。
+    param([string]$Code, [string]$Msg)
+    if (-not $Msg -and -not $Code) { return '' }
+    if ($Msg -match '(?i)missing\s+session') { return '需先建会话' }
+    if ($Code -eq '-32601' -or $Msg -match '(?i)method\s+not\s+found') { return '上游没实现这个方法' }
+    $core = ([string]$Msg).Trim()
+    if ($core.Length -gt 70) { $core = $core.Substring(0, 68) + '…' }
+    return $core
 }
 
 function Get-ProbeVerdict {
@@ -962,8 +996,10 @@ function Render-ProbeResult {
     $url  = $line['URL']; if (-not $url) { $url = '(未知)' }
     $initCode = $line['INIT_HTTP']; $initSession = $line['INIT_SESSION']
     $discCode = $line['DISC_HTTP']; $getCode = $line['GET_HTTP']; $delCode = $line['DEL_HTTP']
+    $disc2Code = $line['DISC2_HTTP']
     $init = Parse-ProbeBody $line['INIT_BODY']
     $disc = Parse-ProbeBody $line['DISC_BODY']
+    $disc2 = Parse-ProbeBody $line['DISC2_BODY']
     $verdict = Get-ProbeVerdict $initCode $init $discCode $disc
 
     $black  = [Drawing.Color]::Black
@@ -1069,11 +1105,27 @@ function Render-ProbeResult {
         }
     }
     $initNote = if ($initOk) { 'HTTP ' + $initCode + ' · 协商版本 ' + $init.Version } else { 'HTTP ' + $initCode + $(if ($init.ErrCode) { ' · [' + $init.ErrCode + '] ' + $init.ErrMsg }) }
-    $discNote = if ($discOk) { 'HTTP ' + $discCode + ' · 支持的版本 ' + $disc.SupportedVersions } else { 'HTTP ' + $discCode + $(if ($disc.ErrCode) { ' · [' + $disc.ErrCode + ']' + $(if ($discErrText) { ' ' + $discErrText }) }) }
+    # 数字错误码短，直接挂主行；字母错误码（如 INITIALIZATION_REQUIRED）太长，挪到下面单独一行
+    $discCodeIsNum = [bool]($disc.ErrCode -match '^-?\d+$')
+    $discErrCore = if ($discOk) { '' } else { Format-ProbeErr $disc.ErrCode $discErrText }
+    $discNote = if ($discOk) { 'HTTP ' + $discCode + ' · 支持的版本 ' + $disc.SupportedVersions } else { 'HTTP ' + $discCode + $(if ($discCodeIsNum) { ' · [' + $disc.ErrCode + ']' } else { '' }) + $(if ($discErrCore) { ' · ' + $discErrCore } else { '' }) }
     Add-Line ('  [' + (State-Symbol $initState) + '] 2025-11-25 有状态握手（Sessionful）   ' + $initNote) (State-Color $initState)
     Add-Line ('  [' + (State-Symbol $discState) + '] 2026-07-28 无状态（Stateless）      ' + $discNote.TrimEnd()) (State-Color $discState)
     if ($discSupported) { Add-Line (' 上游支持的版本: ' + $discSupported) $gray }
     if ($discBadVer) { Add-Line (' 上游不支持的版本: ' + $discBadVer) $gray }
+    if ($disc.ErrCode -and -not $discCodeIsNum) { Add-Line (' 上游错误码: ' + $disc.ErrCode) $gray }
+    # 带会话号补打的那一发：能证明"不是没握手，而是上游压根不认 2026-07-28"
+    if ($disc2Code -and $disc2Code -ne '000') {
+        $d2Text = [string]$disc2.ErrMsg
+        $d2Show = ''
+        $m2 = [regex]::Match($d2Text, '(?i)Unsupported protocol version\s*:\s*(\S+)')
+        if ($m2.Success) {
+            $d2Show = '仍不支持 ' + $m2.Groups[1].Value + $(if ($disc2.ErrCode) { '（' + $disc2.ErrCode + '）' })
+        } else {
+            $d2Show = Format-ProbeErr $disc2.ErrCode $d2Text
+        }
+        Add-Line (' 带会话号再打一发: HTTP ' + $disc2Code + $(if ($d2Show) { ' · ' + $d2Show } else { '' })) $gray
+    }
     Add-Line ''
 
     # --- 会话能力：会话号 / 通知流 / 会话删除 ---
@@ -1137,7 +1189,8 @@ function Render-ProbeResult {
                 Add-Line ('  判定: 必须开启 rewrite_host —— 换成外部 Host 就被拒（HTTP ' + $line['VAR_HTTP'] + '），只有本机名能访问') $red
             }
             'free' {
-                Add-Line ('  判定: 不必开启 rewrite_host —— 外部 Host 也照常应答（HTTP ' + $line['VAR_HTTP'] + '），上游没做 Host 白名单') $green
+                Add-Line '  判定: 不必开启 rewrite_host' $green
+                Add-Line ('        外部 Host 也照常应答（HTTP ' + $line['VAR_HTTP'] + '），上游没做 Host 白名单') $green
             }
             default {
                 if ($initCode -eq '000') {
