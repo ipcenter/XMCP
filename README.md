@@ -168,7 +168,7 @@ powershell -ExecutionPolicy Bypass -File ".\check-mcp-relay.ps1"     # 只做连
 | 连通性显示 `000` 不通 | 端口没应答。缩进行会写出具体原因：反代没在该地址监听（进程没起），或端口在监听但连接没建立（防火墙/地址写错） |
 | 显示 `401` / `403` / `404` 但标「连通」 | **这是好事**：状态码来自上游，说明链路已打通（`401` 缺令牌、`403` 令牌不对或 Host 校验、`404` 路径不对） |
 | 显示 `502` 标「上游异常」 | 反代在跑，但没拿到上游响应。缩进行会写明"上游 `127.0.0.1:x` 没有监听"（服务没开/已退出）或"在监听但不应答"（路径不对、或 HTTPS 端口写了 `http`）。常见原因见日志 `UPSTREAM FAIL ... Remote end closed connection without response` |
-| `403 Invalid Host` | 把 `rewrite_host` 改成 `true` |
+| `403 Invalid Host` / 上游回 `403` | 状态页那行原因会按配置实况说话：`rewrite_host` 已是 `true` 时不必再改，问题在令牌（客户端要自带 `Authorization: Bearer`）；配置里是 `false` 才需要改成 `true` 后重启代理 |
 | 虚拟机连不上，宿主机自己能连 | 检查 `listen` 是否是虚拟网卡网关地址（如 VMware 的 `192.168.x.1`）、防火墙是否放行、虚拟机与宿主机是否同网段 |
 | 端口被占用 / 监听没起来 | 反代进程已在跑（`mcp-relay.pid`），或另一个副本也在跑；先「2. 退出关闭」再启动 |
 | 找不到 python | 装 Python 3 并勾选加入 PATH，或把 `pythonw.exe` 加到 PATH |

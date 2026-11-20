@@ -256,10 +256,12 @@ function Test-PortListening {
 
 function Get-ConnDiag {
     # 把一条探测结果翻译成「结论 + 具体原因」，别只给连通/不通两个词
-    param([string]$Code, [string]$Url, [string]$Target, [string]$NsText)
+    # RewriteHost: 该代理配置里 rewrite_host 的实际值；403 提示要按它说话，已经开了就别再劝人开
+    param([string]$Code, [string]$Url, [string]$Target, [string]$NsText, $RewriteHost = $null)
     $r = @{ Verdict = '连通'; Detail = '' }
     $u = Get-HostPort $Url
     $tg = Get-HostPort $Target
+    $isHttpsTarget = ($Target -match '^\s*https://')
 
     if ($Code -eq '000') {
         $r.Verdict = '不通'
@@ -276,8 +278,11 @@ function Get-ConnDiag {
         $localTarget = $tg.Host -in @('127.0.0.1', 'localhost', '::1', '0.0.0.0')
         if ($localTarget -and -not (Test-PortListening $tg.Port $NsText $tg.Host)) {
             $r.Detail = '上游 ' + $tg.Host + ':' + $tg.Port + ' 没有监听（上游服务没开或已退出）'
+        } elseif ($localTarget -and $isHttpsTarget) {
+            # target 已经是 https://，就不要再劝人改成 https
+            $r.Detail = '上游 ' + $tg.Host + ':' + $tg.Port + ' 在监听但 HTTPS 握不上（端口/证书不对，或该端口其实是明文 HTTP）'
         } elseif ($localTarget) {
-            $r.Detail = '上游 ' + $tg.Host + ':' + $tg.Port + ' 在监听但不应答（路径不对，或把 http 写到了只开 https 的端口）'
+            $r.Detail = '上游 ' + $tg.Host + ':' + $tg.Port + ' 在监听但不应答（target 里没写路径或路径不对，或上游只开了 HTTPS 而这个端口是明文的）'
         } else {
             $r.Detail = '上游 ' + $tg.Host + ':' + $tg.Port + ' 无法应答（远端服务未开或不互通）'
         }
@@ -287,8 +292,17 @@ function Get-ConnDiag {
     switch -Regex ($Code) {
         '^2'  { $r.Detail = '正常应答' }
         '^3'  { $r.Detail = '已到达上游，返回重定向' }
-        '401' { $r.Detail = '已到达上游，需要令牌（401）' }
-        '403' { $r.Detail = '已到达上游，被拒绝（403：令牌不对，或上游校验 Host 而 rewrite_host 没开）' }
+        '401' { $r.Detail = '已到达上游，需要令牌（401）：客户端请求要自带 Authorization: Bearer' }
+        '403' {
+            # 按配置实际情况给建议：rewrite_host 已开就只说令牌/其它限制
+            if ($RewriteHost -eq $true) {
+                $r.Detail = '已到达上游，被拒绝（403）：令牌不对或缺失；配置里 rewrite_host 已是 true，Host 这一项不用再改'
+            } elseif ($RewriteHost -eq $false) {
+                $r.Detail = '已到达上游，被拒绝（403）：令牌不对或缺失；若上游校验 Host，把 rewrite_host 改成 true 再重启代理'
+            } else {
+                $r.Detail = '已到达上游，被拒绝（403）：令牌不对或缺失；上游若校验 Host，需要 rewrite_host 为 true'
+            }
+        }
         '404' { $r.Detail = '已到达上游，路径不存在（404：查 URL 路径与 target 的端口/路径）' }
         default { if ($Code -match '^4') { $r.Detail = '已到达上游，请求被拒（' + $Code + '）' } else { $r.Detail = '已到达上游（' + $Code + '）' } }
     }
@@ -413,7 +427,7 @@ function Get-StatusText {
             $url = 'http://' + $h + ':' + $pt + '/'
             $total++
             $code = Test-Endpoint -Url $url
-            $diag = Get-ConnDiag -Code $code -Url $url -Target $p.Target -NsText $nsText
+            $diag = Get-ConnDiag -Code $code -Url $url -Target $p.Target -NsText $nsText -RewriteHost $p.RewriteHost
             switch ($diag.Verdict) {
                 '不通'     { $bad++ }
                 '上游异常' { $warn++ }
@@ -427,6 +441,7 @@ function Get-StatusText {
     $sum = '  小结: ' + $ok + '/' + $total + ' 个地址通达'
     if ($warn -gt 0) { $sum += '，' + $warn + ' 个上游异常' }
     if ($bad -gt 0) { $sum += '，' + $bad + ' 个不通' }
+    [void]$sb.AppendLine('')
     [void]$sb.AppendLine($sum)
     [void]$sb.AppendLine('  （000=不通；5xx=反代在跑但上游没应答；401/404/200 等=已到达上游；每条的原因见下面缩进行）')
     $script:lastVerdict = $ok.ToString() + '/' + $total.ToString() + ' 地址通达'
