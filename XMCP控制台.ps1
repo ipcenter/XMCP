@@ -999,28 +999,28 @@ function Render-ProbeResult {
     $initState = if ($initCode -in @('401', '403')) { 'unknown' } elseif ($initOk) { 'yes' } elseif ($initCode -eq '000') { 'unknown' } else { 'no' }
     $discState = if ($discCode -in @('401', '403')) { 'unknown' } elseif ($discOk) { 'yes' } elseif ($discCode -eq '000') { 'unknown' } else { 'no' }
     $initNote = if ($initOk) { 'HTTP ' + $initCode + ' · 协商版本 ' + $init.Version } else { 'HTTP ' + $initCode + $(if ($init.ErrCode) { ' · [' + $init.ErrCode + '] ' + $init.ErrMsg }) }
-    $discNote = if ($discOk) { 'HTTP ' + $discCode + ' · supportedVersions: ' + $disc.SupportedVersions } else { 'HTTP ' + $discCode + $(if ($disc.ErrCode) { ' · [' + $disc.ErrCode + '] ' + $disc.ErrMsg }) }
-    Add-Line ('  [' + (State-Symbol $initState) + '] 2025-11-25 Sessionful    ' + $initNote) (State-Color $initState)
-    Add-Line ('  [' + (State-Symbol $discState) + '] 2026-07-28 Stateless     ' + $discNote) (State-Color $discState)
+    $discNote = if ($discOk) { 'HTTP ' + $discCode + ' · 支持的版本 ' + $disc.SupportedVersions } else { 'HTTP ' + $discCode + $(if ($disc.ErrCode) { ' · [' + $disc.ErrCode + '] ' + $disc.ErrMsg }) }
+    Add-Line ('  [' + (State-Symbol $initState) + '] 2025-11-25 有状态握手（Sessionful）   ' + $initNote) (State-Color $initState)
+    Add-Line ('  [' + (State-Symbol $discState) + '] 2026-07-28 无状态（Stateless）      ' + $discNote) (State-Color $discState)
     Add-Line ''
 
     # --- 会话能力：会话号 / 通知流 / 会话删除 ---
     Add-Line '会话能力' $black
     $sidState = if ($initSession) { 'yes' } elseif ($initCode -in @('401', '403', '000')) { 'unknown' } else { 'no' }
-    Add-Line ('  [' + (State-Symbol $sidState) + '] Mcp-Session-Id      ' + $(if ($initSession) { $initSession } else { '响应头未带会话号' })) (State-Color $sidState)
+    Add-Line ('  [' + (State-Symbol $sidState) + '] 会话号（Mcp-Session-Id）  ' + $(if ($initSession) { $initSession } else { '响应头里没带' })) (State-Color $sidState)
     $getState = Get-CheckState $getCode '200'
     $delState = Get-CheckState $delCode '200,202,204'
-    Add-Line ('  [' + (State-Symbol $getState) + '] GET Notification Stream   HTTP ' + $getCode) (State-Color $getState)
-    Add-Line ('  [' + (State-Symbol $delState) + '] DELETE Session            HTTP ' + $delCode) (State-Color $delState)
+    Add-Line ('  [' + (State-Symbol $getState) + '] 通知流（GET 长连接）      HTTP ' + $getCode) (State-Color $getState)
+    Add-Line ('  [' + (State-Symbol $delState) + '] 关闭会话（DELETE）        HTTP ' + $delCode) (State-Color $delState)
     Add-Line ''
 
     # --- 服务端能力：两条腿上报的 capabilities 取并集 ---
-    Add-Line '服务端能力（来自 capabilities）' $black
+    Add-Line '服务端能力（capabilities 声明）' $black
     $tools = $init.Tools -or $disc.Tools
     $res   = $init.Resources -or $disc.Resources
     $prom  = $init.Prompts -or $disc.Prompts
     $capState = { param($b) if ($b) { 'yes' } else { 'no' } }
-    Add-Line ('  [' + (State-Symbol (& $capState $tools)) + '] Tools   [' + (State-Symbol (& $capState $res)) + '] Resources   [' + (State-Symbol (& $capState $prom)) + '] Prompts') $black
+    Add-Line ('  [' + (State-Symbol (& $capState $tools)) + '] 工具（Tools）   [' + (State-Symbol (& $capState $res)) + '] 资源（Resources）   [' + (State-Symbol (& $capState $prom)) + '] 提示（Prompts）') $black
     Add-Line ''
 
     $server = $init.ServerName; $serverVer = $init.ServerVer
@@ -1092,11 +1092,12 @@ function Render-ProbeResult {
     $concl = ''; $conclColor = $gray
     switch ($verdict) {
         'dual' {
-            $concl = '结论: 新旧两套协议都支持（Sessionful + Stateless），同规范客户端一般可直连。'
+            $concl = '结论: 新旧两套协议都支持（有状态 + 无状态），同规范客户端一般可直连。'
             $conclColor = $green
         }
         'old' {
-            $concl = '结论: 仅旧规范（有状态握手，' + $init.Version + '）。按 2026-07-28 无状态规范来的客户端，需要桥接层做握手与会话适配。'
+            $concl = '结论: 仅旧规范（有状态握手，' + $init.Version + '）。' + "`r`n" +
+                     '  按 2026-07-28 无状态规范来的客户端，需要桥接层做握手与会话适配。'
             $conclColor = $orange
         }
         'new' {
@@ -1130,6 +1131,29 @@ function Render-ProbeResult {
         }
     }
     Add-Line $concl $conclColor
+    Add-Line ''
+
+    # --- 名词解释：上面这些英文术语到底指什么 ---
+    Add-Line '名词解释' $black
+    Add-Line '  · 有状态（Sessionful）：旧规范 2025-11-25 的做法。客户端先 initialize 握手，' $black
+    Add-Line '    服务端回一个会话号，后续请求都带着它续上下文。' $black
+    Add-Line '  · 无状态（Stateless）：新规范 2026-07-28 的做法。不建会话、不发会话号，' $black
+    Add-Line '    每个请求自带完整元信息，能力用 server/discover 一次性问出来。' $black
+    Add-Line '  · initialize：旧规范的握手请求，协商版本，顺带拿到会话号。' $black
+    Add-Line '  · server/discover：新规范的能力发现请求，回支持的版本与 capabilities。' $black
+    Add-Line '  · 会话号（Mcp-Session-Id）：服务端在响应头给出的会话标识，' $black
+    Add-Line '    后续请求靠它续上；不发会话号的实现只能用无状态方式。' $black
+    Add-Line '  · 通知流（GET 长连接）：服务端主动往下推事件的通道；' $black
+    Add-Line '    不提供也不影响调用，工具照样能一条条 POST 调。' $black
+    Add-Line '  · 关闭会话（DELETE）：客户端显式告诉服务端"这个会话结束了"。' $black
+    Add-Line '  · capabilities：服务端声明的能力清单，下面三项就来自这里。' $black
+    Add-Line '  · 工具（Tools）：可被调用的动作，最常用；资源（Resources）：可读取的数据；' $black
+    Add-Line '    提示（Prompts）：预置的提示词模板。' $black
+    Add-Line '  · 基线 / 变体：基线是 Host 保持本机名打的那一发，' $black
+    Add-Line '    变体是只把 Host 头换成外部地址、其余不变打的那一发。' $black
+    Add-Line '  · rewrite_host：配置项。开=反代把 Host 头改写成上游地址，专治只认本机名的服务；' $black
+    Add-Line '    关=原样透传客户端带来的 Host。' $black
+
     # 渲染完再套一次内边距：Update-Layout 阶段句柄可能还没创建，EM_SETRECT 会被跳过；
     # 此时窗口已显示、句柄存在，确保文字四周和状态页一样留白。
     Set-TextInnerPad $rt
