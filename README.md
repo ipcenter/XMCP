@@ -143,6 +143,8 @@ powershell -ExecutionPolicy Bypass -File ".\check-mcp-relay.ps1"     # 只做连
 
   变体 Host 优先取配置里对应代理的 `listen` 地址（就是你真正会用的那个），配置里没有对应代理时退化为哨兵名 `xmcp-probe.example:端口`。若地址栏填成了反代监听地址，这一节会跳过并直接写出应改填的上游本体地址。
 
+  有的上游（Obsidian MCP 就是）用 `text/event-stream` 回包，程序会把 `data:` 帧里的 JSON 抠出来再解析，不会因为回了 SSE 就误判成"不是 MCP"。新规范那一发本来就不带会话号，只支持旧规范的服务端会先用"缺少会话"把它顶回来；这时程序用它自己的会话号补打一发（带 `Mcp-Session-Id`），把 `-32000 Unsupported protocol version` 或 `-32601 Method not found` 单列一行——这才是"上游没实现新规范"的确凿证据。上游的英文报错会换成中文短句（需先建会话 / 上游没实现这个方法），字母类错误码（如 `INITIALIZATION_REQUIRED`）另起一行，数字码留在主行。
+
   报告里的术语都带中文：行内写成「有状态握手（Sessionful）」「会话号（Mcp-Session-Id）」「通知流（GET 长连接）」「工具（Tools）」这种，报告最底部的「名词解释」再逐条讲一遍——两套规范的区别、initialize 与 server/discover 各干什么、会话号与通知流有什么用、capabilities 是什么、基线与变体怎么来的、`rewrite_host` 开与关分别意味着什么。
 
   协议兼容性那两条腿，某条不支持时错误消息常带一长串「(supported versions: 2025-11-25, 2025-06-18, ...)」。报告把这段拆成两行：主行只留「不支持的版本: 2026-07-28」，上游支持的版本列表单独缩进一行、逗号换成 ` / `，不会被挤成一条几百像素的窄行。
