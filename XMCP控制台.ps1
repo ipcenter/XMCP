@@ -974,10 +974,43 @@ function Render-ProbeResult {
     $rt = $script:txtProbeResult
     $rt.Clear()
 
+    # 术语高亮：名词名（连同括注英文）加粗 + 蓝色，冒号后的解释保持原行颜色。
+    # 名单按长度降序，先匹配长串（'会话号（Mcp-Session-Id）' 命中后不再单独标 'Mcp-Session-Id'）。
+    $termColor = [Drawing.Color]::FromArgb(0, 90, 200)
+    $termFont = New-Object Drawing.Font($rt.Font.FontFamily, $rt.Font.Size, [Drawing.FontStyle]::Bold)
+    $terms = @(
+        '会话号（Mcp-Session-Id）', '有状态握手（Sessionful）', '无状态（Stateless）',
+        '通知流（GET 长连接）', '关闭会话（DELETE）', '服务端能力（capabilities 声明）',
+        '工具（Tools）', '资源（Resources）', '提示（Prompts）',
+        '有状态（Sessionful）', '基线 / 变体', '上游支持的版本', '不支持的版本',
+        'server/discover', 'Mcp-Session-Id', 'initialize', 'capabilities', 'rewrite_host'
+    )
     function Add-Line {
         param([string]$Text, $Color = $black)
+        $lineStart = $rt.TextLength
         $rt.SelectionColor = $Color
         $rt.AppendText($Text + "`r`n")
+        if ($Text) {
+            $spans = @()
+            foreach ($t in ($terms | Sort-Object -Property @{ Expression = { $_.Length } } -Descending)) {
+                $pos = 0
+                while (($pos = $Text.IndexOf($t, $pos, [StringComparison]::OrdinalIgnoreCase)) -ge 0) {
+                    $s = $pos; $e = $pos + $t.Length
+                    $free = $true
+                    foreach ($sp in $spans) { if ($s -lt $sp.End -and $e -gt $sp.Start) { $free = $false; break } }
+                    if ($free) { $spans += New-Object psobject -Property @{ Start = $s; End = $e } }
+                    $pos = $e
+                }
+            }
+            foreach ($sp in ($spans | Sort-Object Start)) {
+                $rt.Select($lineStart + $sp.Start, $sp.End - $sp.Start)
+                $rt.SelectionFont = $termFont
+                $rt.SelectionColor = $termColor
+            }
+            $rt.Select($rt.TextLength, 0)
+            $rt.SelectionColor = $Color
+            $rt.SelectionFont = $rt.Font
+        }
     }
     function State-Symbol { param($State)
         switch ($State) { 'yes' { '✓' } 'no' { '✗' } 'na' { '–' } default { '?' } }
