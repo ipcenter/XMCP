@@ -1,5 +1,5 @@
 ﻿# XMCP 反代控制台 —— 单窗口，取代原来的三个 bat
-# 用法：双击 XMCP控制台.bat
+# 用法：双击桌面「XMCP 反代工具」快捷方式（直连 powershell 隐藏启动）；命令行排障可直接跑 XMCP控制台.bat
 # 行为：读 mcp-relay.config.json -> 自动启动/检测连通性 -> 按钮随状态变化
 #       通：按钮显示 "1. 最小化（缩到右下角托盘）"，点一下立即缩托盘，零等待
 #       不通：按钮置灰不可点，必须先点 "重启代理"（= 停一次 + 起一次 + 防火墙同步）
@@ -35,19 +35,34 @@ $curlExe   = Join-Path $sys32 'curl.exe'
 $netstatExe = Join-Path $sys32 'netstat.exe'
 $psExe     = Join-Path $sys32 'WindowsPowerShell\v1.0\powershell.exe'
 
+# 隐藏宿主控制台黑窗：控制台进程仍在（托盘、后台探测/启停任务都靠它），只是窗口不显示。
+# 快捷方式直连 powershell.exe、不经 cmd/bat；这里再 P/Invoke 把控制台窗口藏掉作双保险。
+if (-not $BootstrapOnly) {
+    try {
+        $consoleSig = @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")]  public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+'@
+        $consoleUtil = Add-Type -MemberDefinition $consoleSig -Name XmcpConsoleUtil -Namespace Win32 -PassThru
+        $consoleHwnd = $consoleUtil::GetConsoleWindow()
+        if ($consoleHwnd -ne [IntPtr]::Zero) { [void]$consoleUtil::ShowWindow($consoleHwnd, 0) }  # 0 = SW_HIDE
+    } catch { }
+}
+
 # 快捷方式：.lnk 里只能存绝对路径，所以它一旦跟着目录被拷到别的盘，就还指着老地方。
 # 对策是「每次启动都自检 + 就地改写」：
-#   1. 目录里那一份（XMCP 反代工具.lnk，X 图标）：首次运行由 bat 拉起控制台时自动生成，
-#      之后启动发现 Target 不是本目录的 bat 就重写 —— 复制到新盘、先点 bat 一次即自动纠正；
+#   1. 目录里那一份（XMCP 反代工具.lnk，X 图标）：首次运行由控制台自举生成，
+#      之后启动发现 Target 不是本目录的 powershell 快捷方式就重写 —— 复制到新盘、先点一次即自动纠正；
 #   2. 桌面那一份：存在则跟着最近一次运行的程序目录自动对齐。
 function Write-LocalShortcut {
     param([string]$LnkPath, [string]$Label)
     try {
-        $bat = Join-Path $root 'XMCP控制台.bat'
-        if (-not (Test-Path -LiteralPath $bat)) { return }
+        $ps1 = Join-Path $root 'XMCP控制台.ps1'
+        if (-not (Test-Path -LiteralPath $ps1)) { return }
         $ico = Join-Path $root 'xmcp.ico'
         $s = (New-Object -ComObject WScript.Shell).CreateShortcut($LnkPath)
-        $s.TargetPath = $bat
+        $s.TargetPath = $psExe
+        $s.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ps1 + '"'
         $s.WorkingDirectory = $root
         if (Test-Path -LiteralPath $ico) { $s.IconLocation = $ico + ',0' }
         $s.Description = 'XMCP 反代工具'
@@ -59,13 +74,14 @@ function Write-LocalShortcut {
 
 function Repair-Shortcut {
     try {
-        $bat = Join-Path $root 'XMCP控制台.bat'
-        if (-not (Test-Path -LiteralPath $bat)) { return }
+        $ps1 = Join-Path $root 'XMCP控制台.ps1'
+        if (-not (Test-Path -LiteralPath $ps1)) { return }
         # 目录里那份：没有就建，有但指错就重写
         $local = Join-Path $root 'XMCP 反代工具.lnk'
         $okLocal = $false
         if (Test-Path -LiteralPath $local) {
-            $okLocal = ((New-Object -ComObject WScript.Shell).CreateShortcut($local)).TargetPath -eq $bat
+            $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($local)
+            $okLocal = ($sc.TargetPath -eq $psExe) -and ($sc.Arguments -like ('*' + $ps1 + '*'))
         }
         if (-not $okLocal) { Write-LocalShortcut -LnkPath $local -Label 'local' }
         # 桌面那份：只修正已存在的，不擅自往桌面新建
@@ -73,9 +89,9 @@ function Repair-Shortcut {
         if ($desktop) {
             $lnk = Join-Path $desktop 'XMCP 反代工具.lnk'
             if (Test-Path -LiteralPath $lnk) {
-                if (((New-Object -ComObject WScript.Shell).CreateShortcut($lnk)).TargetPath -ne $bat) {
-                    Write-LocalShortcut -LnkPath $lnk -Label 'desktop'
-                }
+                $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+                $okDesktop = ($sc.TargetPath -eq $psExe) -and ($sc.Arguments -like ('*' + $ps1 + '*'))
+                if (-not $okDesktop) { Write-LocalShortcut -LnkPath $lnk -Label 'desktop' }
             }
         }
     } catch { }
@@ -116,7 +132,7 @@ function Write-UiLog {
 }
 
 # ===== 首次运行自举：配置文件不在就按本机环境生成一份 =====
-# 别人把这个目录拷到任意路径、任意机器，双击 bat 就能跑：配置、日志、快捷方式全部就地长出来。
+# 别人把这个目录拷到任意路径、任意机器，双击快捷方式就能跑：配置、日志、快捷方式全部就地长出来。
 function Get-DefaultListenAddress {
     # 优先挑一块能出去的真实网卡地址；VMware/Hyper-V 虚拟网卡（192.168.110.x 之类）排后面。
     # 都没有就退回 0.0.0.0（监听全部网卡），至少保证能用。
@@ -2722,7 +2738,7 @@ XMCP 局域网反代工具 · 使用说明
 · 临时把某个本机 Web 工具暴露给同事看一眼，用完点「2. 退出关闭」即收回。
 
 五、怎么用（三步）
-1. 双击「XMCP 反代工具」快捷方式或「XMCP控制台.bat」。
+1. 双击桌面「XMCP 反代工具」快捷方式（直连 powershell 隐藏启动，不弹黑窗）；命令行排障可直接跑 XMCP控制台.bat。
    程序会自动拉起反代并自检，状态页 [连通性] 全为「连通」、healthy=True 即正常；
    出现「上游异常」说明反代在跑但上游没应答，缩进行会写出具体卡在哪。
 2. 客户端（虚拟机 / 另一台电脑）里访问 http://192.168.110.1:12335/mcp（带令牌），
@@ -2754,7 +2770,7 @@ XMCP 局域网反代工具 · 使用说明
 · 只想临时开一个端口：把其它 proxy 的 enabled 设成 false，或点「2. 退出关闭」停掉反代。
 
 七、文件都在这个目录
-XMCP控制台.bat                            双击入口（换目录后先双击它）
+XMCP控制台.bat                            命令行排障入口（经一层 cmd，会带控制台窗口）
 XMCP 反代工具.lnk                         首次运行自动生成（X 图标），指错会自动改写
 重建快捷方式.bat                          在桌面也建一份快捷方式
 XMCP控制台.ps1                            控制台本体
@@ -2770,7 +2786,7 @@ README.md                                 完整文档（含排障记录）
 
 八、分享给别人 / 换一台机器
 1. 直接把整个目录打包（zip 或拷 U 盘）发出去，对方解压到任意路径即可，不需要安装。
-2. 第一次双击 XMCP控制台.bat，程序会自己完成三件事：
+2. 第一次双击桌面快捷方式，程序会自己完成三件事：
    · 没有 mcp-relay.config.json 就按本机网卡自动生成一份（监听地址、网段都取当前机器）；
    · 在目录里生成「XMCP 反代工具.lnk」（黄底黑 X 图标），以后双击它就够；
    · 起反代 + 比对防火墙（首次会弹一次 UAC，允许即可）。
