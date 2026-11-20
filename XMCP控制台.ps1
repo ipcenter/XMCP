@@ -764,7 +764,8 @@ $disc = Split-Response $discRaw
 
 # 新规范这一发是按 2026-07-28（无状态）打的，不带会话号。
 # 只支持旧规范的服务端会直接挑"缺少会话"拒掉；这时用它自己的会话号再打一发，
-# 拿到的 -32601 Method not found 才是"未实现 server/discover"的确凿证据。
+# 只用于排除"只是缺会话才被拒"的干扰；带旧会话号不是新规范的正确姿势，
+# 这一发结果不作为新协议兼容判定依据。拿到的 -32601 Method not found 可佐证"未实现 server/discover"。
 $disc2Code = ''; $disc2Body = ''
 if ($init.Session -and $disc.Code -notmatch '^2') {
     $disc2Raw = Split-Response (Invoke-McpPost -Url $u -Tok $tok -Method 'server/discover' -Version '2026-07-28' -Params @{} -EnvelopeMeta $meta -McpMethod 'server/discover' -Session $init.Session)
@@ -1136,7 +1137,9 @@ function Render-ProbeResult {
     if ($discSupported) { Add-Line (' 上游支持的版本: ' + $discSupported) $gray }
     if ($discBadVer) { Add-Line (' 上游不支持的版本: ' + $discBadVer) $gray }
     if ($disc.ErrCode -and -not $discCodeIsNum) { Add-Line (' 上游错误码: ' + $disc.ErrCode) $gray }
-    # 带会话号补打的那一发：能证明"不是没握手，而是上游压根不认 2026-07-28"
+    # 带旧会话号补打的一发：只用于排除"第一发只是缺会话才被拒"的干扰。
+    # 新规范 2026-07-28 已取消协议级会话，带旧会话号不是新规范的正确姿势，
+    # 这一发的结果不作为新协议兼容性判定依据（判定只看上面不带会话号的第一发）。
     if ($disc2Code -and $disc2Code -ne '000') {
         $d2Text = [string]$disc2.ErrMsg
         $d2Show = ''
@@ -1146,7 +1149,7 @@ function Render-ProbeResult {
         } else {
             $d2Show = Format-ProbeErr $disc2.ErrCode $d2Text
         }
-        Add-Line (' 带会话号再打一发: HTTP ' + $disc2Code + $(if ($d2Show) { ' · ' + $d2Show } else { '' })) $gray
+        Add-Line (' 排除性诊断（带旧会话号，非新规范姿势）: HTTP ' + $disc2Code + $(if ($d2Show) { ' · ' + $d2Show } else { '' })) $gray
     }
     Add-Line ''
 
@@ -1212,9 +1215,11 @@ function Render-ProbeResult {
                 Add-Line ('  判定: 必须开启 rewrite_host —— 换成外部 Host 就被拒（HTTP ' + $line['VAR_HTTP'] + '），只有本机名能访问') $red
             }
             'free' {
-                Add-Line '  判定: 不必开启 rewrite_host' $green
-                Add-Line ('        外部 Host 也照常应答（HTTP ' + $line['VAR_HTTP'] + '），上游没做 Host 白名单') $green
-                Add-Line '        改 Host 头不等于另一台机器访问，不能据此判断局域网可达。' $gray
+                Add-Line '  判定: 未发现上游存在 Host 白名单限制' $green
+                Add-Line ('        两种 Host 值都照常应答（HTTP ' + $line['VAR_HTTP'] + '）；rewrite_host=true 可保留，') $gray
+                Add-Line '        本次 Host 测试尚未证明它是必要配置。' $gray
+                Add-Line '        本测试不验证 Origin 校验、DNS Rebinding 防护与实际局域网访问；' $gray
+                Add-Line '        改 Host 头不等于另一台机器访问。' $gray
             }
             default {
                 if ($initCode -eq '000') {
@@ -1280,13 +1285,14 @@ function Render-ProbeResult {
     # --- 名词解释：上面这些英文术语到底指什么 ---
     Add-Line '名词解释' $black $true
     Add-Line '  · 有状态（Sessionful）：旧规范 2025-11-25 的做法。客户端先 initialize 握手，' $black
-    Add-Line '    服务端回一个会话号，后续请求都带着它续上下文。' $black
+    Add-Line '    服务端可回一个会话号，后续请求都带着它续上下文。' $black
     Add-Line '  · 无状态（Stateless）：新规范 2026-07-28 的做法。不建会话、不发会话号，' $black
-    Add-Line '    每个请求自带完整元信息，能力用 server/discover 一次性问出来。' $black
+    Add-Line '    协议元数据放在请求 _meta 里，能力用 server/discover 一次性问出来。' $black
     Add-Line '  · initialize：旧规范的握手请求，协商版本，顺带拿到会话号。' $black
     Add-Line '  · server/discover：新规范的能力发现请求，回支持的版本与 capabilities。' $black
-    Add-Line '  · 会话号（Mcp-Session-Id）：服务端在响应头给出的会话标识，' $black
-    Add-Line '    后续请求靠它续上；不发会话号的实现只能用无状态方式。' $black
+    Add-Line '  · 会话号（Mcp-Session-Id）：旧版 Streamable HTTP 中，服务端可通过响应头' $black
+    Add-Line '    分配会话标识；若分配了，客户端后续请求需携带它。旧版协议允许不使用会话号，' $black
+    Add-Line '    不能单凭有无会话号判断协议版本。' $black
     Add-Line '  · 通知流（GET 长连接）：服务端主动往下推事件的通道；' $black
     Add-Line '    不提供也不影响调用，工具照样能一条条 POST 调。HTTP 200 只说明端点应答，' $black
     Add-Line '    未校验连接保持与事件推送。' $black
@@ -2602,7 +2608,7 @@ $tabProbe.Padding = New-Object Windows.Forms.Padding(3)
 $script:tabProbe = $tabProbe
 
 $lblProbeHint = New-Object Windows.Forms.Label
-$lblProbeHint.Text = "地址必须填「上游本体地址」——服务自己监听的那个地址，形如 http(s)://127.0.0.1:端口/mcp。不要填反代对你的监听地址（192.168.x.x:端口）：那是门面，Host 已被反代改写，探针在这儿测不出真实情况，Host 校验只能跳过。`r`n点「开始探测」：按旧规范发 initialize、按新规范发 server/discover，再发一发只换 Host 头的变体，判断这条链路是否必须开 rewrite_host。上游要登录就在令牌框填 API Key，只发 Authorization: Bearer，内容打码、不写日志。"
+$lblProbeHint.Text = "地址必须填「上游本体地址」——服务自己监听的那个地址，形如 http(s)://127.0.0.1:端口/mcp。不要填反代对你的监听地址（192.168.x.x:端口）：那是门面，Host 已被反代改写，探针在这儿测不出真实情况，Host 校验只能跳过。`r`n点「开始探测」：按旧规范发 initialize、按新规范发 server/discover，再发一发只换 Host 头的变体，判断这条链路是否必须开 rewrite_host，还是未发现 Host 白名单限制。上游要登录就在令牌框填 API Key，只发 Authorization: Bearer，内容打码、不写日志。"
 $lblProbeHint.AutoSize = $false
 $lblProbeHint.TextAlign = [Drawing.ContentAlignment]::TopLeft
 $panelProbeHint = New-HintPanel $lblProbeHint 64
