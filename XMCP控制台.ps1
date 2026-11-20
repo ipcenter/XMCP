@@ -800,7 +800,7 @@ if ($init.Session) {
 
 # ---- Host 校验：只把 Host 头换成外部地址，路径/报文/令牌一字不改 ----
 # 基线（Host=URL 里的主机名）与变体（Host=反代对外地址或哨兵名）对比，
-# 差出 2xx vs 403 就说明上游做了 Host 白名单，此链路必须开 rewrite_host。
+# 差出 2xx vs 403 只说明上游做了 Host 白名单；是否必须开 rewrite_host，还要看反代最终转发的 Host。
 $varCode = ''; $varBody = ''
 if ($HostVariant) {
     $varRaw = Invoke-McpPost -Url $u -Tok $tok -Method 'initialize' -Version '2025-11-25' -Params $initParams -HostOverride $HostVariant
@@ -1121,7 +1121,9 @@ function Render-ProbeResult {
     $initOk = [bool]$init.Version
     $discOk = [bool]($disc.SupportedVersions -or $disc.ResultType)
     $initState = if ($initCode -in @('401', '403')) { 'unknown' } elseif ($initOk) { 'yes' } elseif ($initCode -eq '000') { 'unknown' } else { 'no' }
-    $discState = if ($discCode -in @('401', '403')) { 'unknown' } elseif ($discOk) { 'yes' } elseif ($discCode -eq '000') { 'unknown' } else { 'no' }
+    # 方法未找到不等于版本不支持：这类错误归"无法判断"，不标红色不兼容
+    $discIsMethodErr = ($disc.ErrCode -eq '-32601') -or ([string]$disc.ErrMsg -match '(?i)method\s+not\s+found|unknown\s+method|method\s+not\s+implemented')
+    $discState = if ($discCode -in @('401', '403')) { 'unknown' } elseif ($discOk) { 'yes' } elseif ($discCode -eq '000') { 'unknown' } elseif ($discIsMethodErr) { 'unknown' } else { 'no' }
     # discover 的错误消息里常带「supported versions: ...」长括号串，挤在一行看不出重点：
     # 把列表单独拆出来另起一行，主行只留"哪个版本不被支持"。
     $discErrText = [string]$disc.ErrMsg
@@ -1143,15 +1145,34 @@ function Render-ProbeResult {
             $discErrText = ($discErrText -replace '(?i)Unsupported protocol version\s*:\s*\S+', '').Trim()
         }
     }
+    # 版本列表：成功响应取 result.supportedVersions；失败时取错误消息里的 supported versions
+    $verList = @()
+    if ($disc.SupportedVersions) { $verList = $disc.SupportedVersions -split ',\s*' }
+    elseif ($discSupported) { $verList = $discSupported -split '\s*/\s*' }
+    $hasNewVer = $false
+    foreach ($v in $verList) { if ($v.Trim() -eq '2026-07-28') { $hasNewVer = $true } }
+    # 错误归类（呈现层区分，不改解析）：版本不被接受 / discover 方法未找到 / 其他
+    $isVerErr = ($discBadVer -ne '') -or ($discErrText -match '(?i)unsupported\s+protocol\s+version')
+    $isMethodErr = $discIsMethodErr
     $initNote = if ($initOk) { 'HTTP ' + $initCode + ' · 协商版本 ' + $init.Version } else { 'HTTP ' + $initCode + $(if ($init.ErrCode) { ' · [' + $init.ErrCode + '] ' + $init.ErrMsg }) }
     # 数字错误码短，直接挂主行；字母错误码（如 INITIALIZATION_REQUIRED）太长，挪到下面单独一行
     $discCodeIsNum = [bool]($disc.ErrCode -match '^-?\d+$')
     $discErrCore = if ($discOk) { '' } else { Format-ProbeErr $disc.ErrCode $discErrText }
     $discNote = if ($discOk) { 'HTTP ' + $discCode + ' · 支持的版本 ' + $disc.SupportedVersions } else { 'HTTP ' + $discCode + $(if ($discCodeIsNum) { ' · [' + $disc.ErrCode + ']' } else { '' }) + $(if ($discErrCore) { ' · ' + $discErrCore } else { '' }) }
     Add-Line ('  [' + (State-Symbol $initState) + '] 2025-11-25 旧规范 initialize 握手   ' + $initNote) (State-Color $initState)
-    Add-Line ('  [' + (State-Symbol $discState) + '] 2026-07-28 新规范 server/discover  ' + $discNote.TrimEnd()) (State-Color $discState)
-    if ($discSupported) { Add-Line (' 上游支持的版本: ' + $discSupported) $gray }
-    if ($discBadVer) { Add-Line (' 上游不支持的版本: ' + $discBadVer) $gray }
+    Add-Line ('  [' + (State-Symbol $discState) + '] 2026-07-28 新规范请求  ' + $discNote.TrimEnd()) (State-Color $discState)
+    if ($verList.Count -gt 0) {
+        Add-Line ('  上游版本列表: ' + ($verList -join ' / ')) $gray
+        $verMark = if ($hasNewVer) { '列表包含 2026-07-28' } else { '列表未包含 2026-07-28' }
+        Add-Line ('     ' + $verMark) $gray
+    }
+    if ($discBadVer) { Add-Line ('  上游不支持的版本: ' + $discBadVer) $gray }
+    # discover 是能力发现方法，不等于整个新协议：方法可用性与版本支持分开陈述
+    if ($discOk) { $methodText = 'server/discover 调用成功' }
+    elseif ($isMethodErr) { $methodText = '上游未实现 server/discover，方法不可用' }
+    elseif ($isVerErr) { $methodText = '版本未被接受，discover 方法是否可用本次无法判断' }
+    else { $methodText = '无法判断（HTTP ' + $discCode + '）' }
+    Add-Line ('  discover 方法: ' + $methodText) $gray
     if ($disc.ErrCode -and -not $discCodeIsNum) { Add-Line (' 上游错误码: ' + $disc.ErrCode) $gray }
     # 带旧会话号补打的一发：只用于排除"第一发只是缺会话才被拒"的干扰。
     # 新规范 2026-07-28 已取消协议级会话，带旧会话号不是新规范的正确姿势，
@@ -1227,18 +1248,23 @@ function Render-ProbeResult {
         Add-Line ('  [' + $varSym + '] 变体  Host=' + $varHostText + '    HTTP ' + $line['VAR_HTTP'] + $varTail) $varColor
         if ($hv.Note) { Add-Line ('     ' + $hv.Note) $gray }
 
-        # 判定 + 当前配置实况，一起说清"该不该开、现在开没开"
-        $cfgTail = ''
-        if ($hv.ProxyName -ne '') {
-            if ($hv.Current -eq $true) { $cfgTail = '配置里 [' + $hv.ProxyName + '] 的 rewrite_host 已是 true，当前行为正确' }
-            elseif ($hv.Current -eq $false) { $cfgTail = '配置里 [' + $hv.ProxyName + '] 的 rewrite_host 是 false，需要改成 true 再重启反代' }
-        }
         switch ($hostState) {
             'must' {
-                Add-Line ('  判定: 必须开启 rewrite_host —— 外部 Host 被拒（HTTP ' + $line['VAR_HTTP'] + '），仅基线 Host 可访问') $red
-                Add-Line ('     基线通过的 Host：' + $baseText + '，改写目标应取这个 Host。') $gray
-                Add-Line ('     本次只直连上游比对了两种 Host；反代改写后是否真正生效，') $gray
-                Add-Line '     需经反代实际发一次请求验证。' $gray
+                Add-Line ('  判定: 上游存在 Host 限制 —— 外部 Host 被拒（HTTP ' + $line['VAR_HTTP'] + '），仅基线 Host 可访问') $orange
+                Add-Line ('     基线通过的 Host：' + $baseText) $gray
+                if ($hv.ProxyName -ne '') {
+                    if ($hv.Current -eq $true) {
+                        Add-Line ('     配置 [' + $hv.ProxyName + '] rewrite_host=true：反代改写为基线 Host，方向正确。') $gray
+                    } elseif ($hv.Current -eq $false) {
+                        Add-Line ('     配置 [' + $hv.ProxyName + '] rewrite_host=false：反代会透传客户端 Host，') $gray
+                        Add-Line '     按本次结果会被拒；需开启 rewrite_host、改写为基线 Host 后重启反代。' $gray
+                    }
+                } else {
+                    Add-Line '     是否需要改写，取决于反代最终发给上游的 Host：' $gray
+                    Add-Line '     透传基线 Host 则不必改；透传外部 Host 则需开启 rewrite_host。' $gray
+                }
+                Add-Line '     本次探针直连上游、只比对了两种 Host；反代实际转发的 Host 是否为基线地址，' $gray
+                Add-Line '     需经反代链路实际发一次请求验证。' $gray
             }
             'free' {
                 Add-Line '  判定: 未发现上游存在 Host 白名单限制' $green
@@ -1259,7 +1285,6 @@ function Render-ProbeResult {
                 }
             }
         }
-        if ($cfgTail) { Add-Line ('        ' + $cfgTail) $gray }
     }
     Add-Line ''
 
@@ -1272,9 +1297,16 @@ function Render-ProbeResult {
         }
         'old' {
             $sessionWord = if ($initSession) { '初始化带回了会话号' } else { '未分配会话号' }
-            $concl = '结论: 仅支持 ' + $init.Version + ' 协议版本（' + $sessionWord + '）。' + "`r`n" +
-                     '  按 2026-07-28 版本来的客户端，需要桥接层做协议版本适配；' + "`r`n" +
-                     '  是否需要会话号转换不能预设，后续请求能否直接调用要实际调用验证。'
+            if ($isMethodErr) {
+                $concl = '结论: 旧规范 ' + $init.Version + ' 初始化成功（' + $sessionWord + '）。' + "`r`n" +
+                         '  新规范 server/discover 方法未实现，不能据此判定 2026-07-28 版本是否支持，需另测。'
+            } else {
+                $verWord = if ($hasNewVer) { '版本列表虽列有 2026-07-28，但本次新规范请求未成功' } else { '上游版本列表不含 2026-07-28' }
+                $concl = '结论: 旧规范 ' + $init.Version + ' 初始化成功（' + $sessionWord + '）。' + "`r`n" +
+                         '  ' + $verWord + '。' + "`r`n" +
+                         '  按 2026-07-28 版本来的客户端，需要桥接层做协议版本适配；' + "`r`n" +
+                         '  是否需要会话号转换不能预设，后续请求能否直接调用要实际调用验证。'
+            }
             $conclColor = $orange
         }
         'new' {
@@ -2636,7 +2668,7 @@ $tabProbe.Padding = New-Object Windows.Forms.Padding(3)
 $script:tabProbe = $tabProbe
 
 $lblProbeHint = New-Object Windows.Forms.Label
-$lblProbeHint.Text = "地址必须填「上游本体地址」——服务自己监听的那个地址，形如 http(s)://127.0.0.1:端口/mcp。不要填反代对你的监听地址（192.168.x.x:端口）：那是门面，Host 已被反代改写，探针在这儿测不出真实情况，Host 校验只能跳过。`r`n点「开始探测」：按旧规范发 initialize、按新规范发 server/discover，再发一发只换 Host 头的变体，判断这条链路是否必须开 rewrite_host，还是未发现 Host 白名单限制。上游要登录就在令牌框填 API Key，只发 Authorization: Bearer，内容打码、不写日志。"
+$lblProbeHint.Text = "地址必须填「上游本体地址」——服务自己监听的那个地址，形如 http(s)://127.0.0.1:端口/mcp。不要填反代对你的监听地址（192.168.x.x:端口）：那是门面，Host 已被反代改写，探针在这儿测不出真实情况，Host 校验只能跳过。`r`n点「开始探测」：按旧规范发 initialize、按新规范发能力发现请求（server/discover），再发一发只换 Host 头的变体，判断上游是否存在 Host 限制、是否需要改写 rewrite_host。上游要登录就在令牌框填 API Key，只发 Authorization: Bearer，内容打码、不写日志。"
 $lblProbeHint.AutoSize = $false
 $lblProbeHint.TextAlign = [Drawing.ContentAlignment]::TopLeft
 $panelProbeHint = New-HintPanel $lblProbeHint 64
@@ -2761,10 +2793,10 @@ XMCP 局域网反代工具 · 使用说明
    随后在状态页 [监听] 确认新端口已 LISTENING，[连通性] 显示「连通」。
 4. 「MCP探针」页：地址必须填「上游本体地址」（服务自己监听的那个，如 127.0.0.1:端口/mcp；
    别填反代对你的监听地址，Host 已被改写，测不出真实情况）。点「开始探测」后，
-   探针按旧规范 initialize、新规范 server/discover 各打一发，有会话号再探通知流与会话删除，
+   探针按旧规范 initialize、新规范能力发现请求（server/discover）各打一发，有会话号再探通知流与会话删除，
    最后再打一发只换 Host 头的变体，输出报告：两条协议腿是否支持、会话能力（会话号 /
-   GET 流 / DELETE 会话）、服务端能力（Tools / Resources / Prompts）、这条链路是否必须开
-   rewrite_host，结论分双协议 / 仅旧 / 仅新 / 需要令牌 / 连不上 / Host 必须改写。
+   GET 流 / DELETE 会话）、服务端能力（Tools / Resources / Prompts）、上游是否存在 Host 限制、
+   是否需要改写 rewrite_host，结论分双协议 / 仅旧 / 仅新 / 需要令牌 / 连不上 / Host 受限。
 
 六、几个容易踩的点
 · rewrite_host 只在服务端校验 Host 时才设 true（XTerminal 必须 true，否则 403）；
@@ -2866,7 +2898,7 @@ XMCP 反代工具
   HTTPS 目标握不上、令牌缺失，以及 rewrite_host 的实况（已是 true 就不再劝你改）；
 · MCP 探针：填上游本体地址 + 可选令牌，按旧规范 initialize、新规范 server/discover 各打一发，
   握出会话号再探 GET 通知流与 DELETE 会话，输出兼容性矩阵（双协议 / 仅旧 / 仅新 / 需要鉴权 / 连不上）；
-· Host 校验：探针额外打一发只换 Host 头的变体，与基线对比，判定这条链路是否必须开 rewrite_host；
+· Host 校验：探针额外打一发只换 Host 头的变体，与基线对比，判断上游是否存在 Host 限制、是否需要改写 rewrite_host；
 · 配置编辑：内置编辑器 + 行列定位校验 + 一键格式化（每键一行、2 空格缩进），保存前先验证并留 .bak；
 · 双日志分栏：控制台日志与反代日志分开看，最新一条永远在最上面；
 · 托盘常驻：最小化到右下角，双击图标还原；关窗口不杀反代，反代掉线再还原会自动拉起；
