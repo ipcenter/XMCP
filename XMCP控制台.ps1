@@ -1286,8 +1286,9 @@ function Render-ProbeResult {
     Add-Line '名词解释' $black $true
     Add-Line '  · 有状态（Sessionful）：旧规范 2025-11-25 的做法。客户端先 initialize 握手，' $black
     Add-Line '    服务端可回一个会话号，后续请求都带着它续上下文。' $black
-    Add-Line '  · 无状态（Stateless）：新规范 2026-07-28 的做法。不建会话、不发会话号，' $black
-    Add-Line '    协议元数据放在请求 _meta 里，能力用 server/discover 一次性问出来。' $black
+    Add-Line '  · 无状态（Stateless）：新规范 2026-07-28 的做法。不使用协议级 Session，' $black
+    Add-Line '    不需要旧式 initialize 握手；请求通过协议规定的元数据携带版本等信息，' $black
+    Add-Line '    可使用 server/discover 查询服务端支持的版本与能力。' $black
     Add-Line '  · initialize：旧规范的握手请求，协商版本，顺带拿到会话号。' $black
     Add-Line '  · server/discover：新规范的能力发现请求，回支持的版本与 capabilities。' $black
     Add-Line '  · 会话号（Mcp-Session-Id）：旧版 Streamable HTTP 中，服务端可通过响应头' $black
@@ -1302,8 +1303,9 @@ function Render-ProbeResult {
     Add-Line '    提示（Prompts）：预置的提示词模板。' $black
     Add-Line '  · 基线 / 变体：基线是 Host 保持本机名打的那一发，' $black
     Add-Line '    变体是只把 Host 头换成外部地址、其余不变打的那一发。' $black
-    Add-Line '  · rewrite_host：配置项。开=反代把 Host 头改写成上游地址，专治只认本机名的服务；' $black
-    Add-Line '    关=原样透传客户端带来的 Host。' $black
+    Add-Line '  · rewrite_host：配置项。开启后，反代把转发请求的 Host 头改写为上游目标地址；' $black
+    Add-Line '    关闭后原样透传客户端带来的 Host。适用于上游做 Host 校验、虚拟主机路由' $black
+    Add-Line '    或其他 Host 依赖的场景。Host 与 Origin 是两个不同的请求头，不能互相替代。' $black
 
     # 渲染完再套一次内边距：Update-Layout 阶段句柄可能还没创建，EM_SETRECT 会被跳过；
     # 此时窗口已显示、句柄存在，确保文字四周和状态页一样留白。
