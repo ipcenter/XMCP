@@ -266,6 +266,10 @@ class Trace:
             parts.append("%s=%s" % (key, _tv(val)))
         _trace_write("%s %s\n" % (self._stamp(), " ".join(parts)))
 
+    def separator(self):
+        """组首分隔线，带时间戳前缀（与反代日志同款），便于界面按批次分组显示。"""
+        _trace_write("%s %s\n" % (self._stamp(), _TRACE_SEP))
+
     def touch(self):
         self.last_activity = time.time()
 
@@ -457,7 +461,7 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
 
         # 接入日志：只记头与有无凭证，不记 Token / Session 真值 / 报文正文
         # 每组请求开头一条分隔线，把同一次请求的 CONNECT/UPSTREAM/END 框成一组
-        _trace_write(_TRACE_SEP + "\n")
+        tr.separator()
         tr.event("CONNECT", proxy=cfg["name"], client=self.client_address[0],
                  method=method, path=path, ctype=tr.content_type, accept=tr.accept,
                  proto=tr.protocol_version, session=tr.has_session, auth=tr.auth,

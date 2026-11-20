@@ -132,6 +132,14 @@ function Write-UiLog {
     } catch { }
 }
 
+# 批次分隔线（与反代日志同款 60 个等号，带时间戳前缀，便于界面按批次分组显示）
+function Write-UiLogSep {
+    try {
+        $line = '[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + ('=' * 60)
+        [IO.File]::AppendAllText($uiLog, $line + "`r`n", (New-Object Text.UTF8Encoding($false)))
+    } catch { }
+}
+
 # ===== 首次运行自举：配置文件不在就按本机环境生成一份 =====
 # 别人把这个目录拷到任意路径、任意机器，双击快捷方式就能跑：配置、日志、快捷方式全部就地长出来。
 function Get-DefaultListenAddress {
@@ -659,6 +667,7 @@ function Start-RelayTask {
     $label = '正在启动代理…'
     if ($Mode -eq 'Restart') { $label = '正在重启代理…' }
     Set-StatusText ($label + "`r`n" + '一般 5–10 秒完成。窗口此时可以正常拖动、可以点右上角"-"最小化、也可以点 X 收进托盘，完成后会自动刷新结果。')
+    Write-UiLogSep
     Write-UiLog ('relay task start: ' + $Mode)
     $ps = [PowerShell]::Create()
     [void]$ps.AddScript($script:relayTaskCode)
@@ -1935,6 +1944,7 @@ function Stop-And-Exit {
         $r = [Windows.Forms.MessageBox]::Show("停止反代并退出？`r`n停止后虚拟机将无法访问 MCP。", '确认停止', [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Question)
         if ($r -ne [Windows.Forms.DialogResult]::Yes) { return }
     }
+    Write-UiLogSep
     if ($proc) {
         $out = ''
         try { $out = Invoke-RelayScript -Path $stopPs1 } catch { $out = '停止脚本异常: ' + $_.Exception.Message }
@@ -3363,6 +3373,7 @@ $form.add_FormClosing({
 })
 
 $form.add_Shown({
+    Write-UiLogSep
     Write-UiLog ('t=' + [Math]::Round($script:sw.Elapsed.TotalSeconds, 1) + 's shown -> check')
     Write-UiLog 'console started'
     Repair-Shortcut
