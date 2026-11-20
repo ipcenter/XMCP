@@ -101,6 +101,7 @@ $script:taskTimer   = $null
 $script:probePs     = $null
 $script:probeHandle = $null
 $script:probeTimer  = $null
+$script:probeHostInfo = @{ Variant = ''; Note = ''; Skip = ''; Suggest = '' }
 $script:relayTaskMode = 'Start'
 $script:autoTrayPending = $false
 $script:configDirty = $false
@@ -655,7 +656,7 @@ function Start-RelayTask {
 # 后台任务：旧规范 initialize（有状态握手）、新规范 server/discover（无状态）各打一发，
 # 有会话号再探 GET 通知流与 DELETE 会话；只做探测、不改报文，解析和结论判定放回 UI 线程。
 $script:probeTaskCode = @'
-param($Url, $Token)
+param($Url, $Token, $HostVariant)
 $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
 if (-not (Test-Path -LiteralPath $curl)) { $curl = 'curl.exe' }
 
@@ -663,11 +664,13 @@ if (-not (Test-Path -LiteralPath $curl)) { $curl = 'curl.exe' }
 $tok = ($Token -ireplace '^\s*(Authorization\s*:\s*)?(Bearer\s+)?', '').Trim()
 
 function Invoke-McpPost {
-    param($Url, $Tok, $Method, $Version, $Params, $EnvelopeMeta, $McpMethod)
+    param($Url, $Tok, $Method, $Version, $Params, $EnvelopeMeta, $McpMethod, $HostOverride)
     $headers = @('-H', 'Content-Type: application/json', '-H', 'Accept: application/json, text/event-stream')
     if ($Tok)   { $headers += @('-H', ('Authorization: Bearer ' + $Tok)) }
     if ($Version) { $headers += @('-H', ('MCP-Protocol-Version: ' + $Version)) }
     if ($McpMethod) { $headers += @('-H', ('Mcp-Method: ' + $McpMethod)) }
+    # 只覆盖 Host 头：curl 明确支持 -H 'Host: x' 覆盖自动生成的 Host（--http1.1 保证不会落到 :authority）
+    if ($HostOverride) { $headers += @('-H', ('Host: ' + $HostOverride)) }
     $bodyParams = $Params
     if ($EnvelopeMeta) { $bodyParams = ($Params + @{ _meta = $EnvelopeMeta }) }
     $bodyObj = [ordered]@{ jsonrpc = '2.0'; id = 1; method = $Method; params = $bodyParams }
@@ -743,6 +746,17 @@ if ($init.Session) {
     $delCode = $del.Code
 }
 
+# ---- Host 校验：只把 Host 头换成外部地址，路径/报文/令牌一字不改 ----
+# 基线（Host=URL 里的主机名）与变体（Host=反代对外地址或哨兵名）对比，
+# 差出 2xx vs 403 就说明上游做了 Host 白名单，此链路必须开 rewrite_host。
+$varCode = ''; $varBody = ''
+if ($HostVariant) {
+    $varRaw = Invoke-McpPost -Url $u -Tok $tok -Method 'initialize' -Version '2025-11-25' -Params $initParams -HostOverride $HostVariant
+    $var = Split-Response $varRaw
+    $varCode = $var.Code
+    $varBody = $var.Body
+}
+
 $out = @()
 $out += ('URL=' + $u)
 $out += ('TOKEN_PRESENT=' + $(if ($tok) { 'yes' } else { 'no' }))
@@ -753,6 +767,9 @@ $out += ('DISC_HTTP=' + $disc.Code)
 $out += ('DISC_BODY=' + $disc.Body)
 $out += ('GET_HTTP=' + $getCode)
 $out += ('DEL_HTTP=' + $delCode)
+$out += ('HOST_VARIANT=' + $(if ($HostVariant) { $HostVariant } else { '' }))
+$out += ('VAR_HTTP=' + $(if ($HostVariant) { $varCode } else { '–' }))
+$out += ('VAR_BODY=' + $varBody)
 $out -join "`n"
 '@
 
@@ -803,6 +820,16 @@ function Get-ProbeVerdict {
     return 'unknown'
 }
 
+function Get-HostVerdict {
+    # 只换 Host 头的对比结论：基线通 + 变体被拒 => 上游做了 Host 白名单
+    param([string]$BaseCode, [string]$VarCode)
+    if (-not $VarCode -or $VarCode -eq '–') { return 'na' }
+    if ($BaseCode -notmatch '^2\d\d$') { return 'unknown' }   # 基线就没通，Host 差异被遮住
+    if ($VarCode -match '^2\d\d$') { return 'free' }
+    if ($VarCode -match '^(400|403|421)$') { return 'must' }
+    return 'unknown'
+}
+
 function Get-DefaultProbeUrl {
     # 默认填配置里第一条代理的上游，省得每次手敲；取不到就给本地占位
     try {
@@ -819,6 +846,92 @@ function Get-DefaultProbeUrl {
         }
     } catch { }
     return 'http://127.0.0.1:27124/mcp'
+}
+
+function Get-LanAddress {
+    # 取一个对外网卡 IPv4（优先 192.168.x），用来把 listen 里的通配 0.0.0.0 换成真实地址
+    param([string]$Exclude = '')
+    $ips = @()
+    try {
+        $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+                 Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -ne '0.0.0.0' } |
+                 ForEach-Object { [string]$_.IPAddress })
+    } catch { $ips = @() }
+    if ($ips.Count -eq 0) {
+        try {
+            $ips = @([Net.Dns]::GetHostAddresses([Net.Dns]::GetHostName()) |
+                     Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                     ForEach-Object { [string]$_.IPAddress } |
+                     Where-Object { $_ -notlike '127.*' })
+        } catch { $ips = @() }
+    }
+    foreach ($pat in @('192.168.', '10.', '172.')) {
+        foreach ($x in $ips) { if ($x.StartsWith($pat) -and $x -ne $Exclude) { return $x } }
+    }
+    foreach ($x in $ips) { if ($x -ne $Exclude) { return $x } }
+    return ''
+}
+
+function Get-ProbeHostVariant {
+    # 算出「Host 校验」那一发要用的外部 Host，并把来源写清楚。
+    # 返回 @{ Variant=''; Note=''; Skip=''; Suggest='' }：Skip 非空表示这次不测，并给出该填什么。
+    param([string]$Url)
+    $r = @{ Variant = ''; Note = ''; Skip = ''; Suggest = ''; ProxyName = ''; Current = $null }
+    $hp = Get-HostPort $Url
+    if (-not $hp.Host) { $r.Skip = '地址里没解析出主机名'; return $r }
+
+    $cfg = $null
+    try { $cfg = Get-RelayConfig -Root $root } catch { $cfg = $null }
+    $proxies = @()
+    if ($cfg -and $cfg.Proxies) { $proxies = @($cfg.Proxies) }
+
+    # 按端口找对应代理（target 端口与探针端口一致）
+    $match = $null
+    foreach ($p in $proxies) {
+        $th = Get-HostPort ([string]$p.Target)
+        if ($th.Port -eq $hp.Port) { $match = $p; break }
+    }
+
+    $loopHosts = @('127.0.0.1', 'localhost', '::1', '[::1]')
+    if ($loopHosts -notcontains $hp.Host.ToLower()) {
+        # 填的不是上游本体：判断它是不是某个代理的对外监听地址
+        $owner = $null
+        foreach ($p in $proxies) {
+            for ($i = 0; $i -lt @($p.ListenHost).Count; $i++) {
+                if (([string]$p.ListenHost[$i]) -eq $hp.Host -and ([string]$p.ListenPort[$i]) -eq $hp.Port) { $owner = $p }
+            }
+            if ($owner) { break }
+        }
+        if ($owner) {
+            $r.Skip = '填的是反代监听地址（不是上游本体），Host 已被反代改写，这里测不出真实校验'
+            $r.ProxyName = [string]$owner.Name
+            $r.Current = $owner.RewriteHost
+            $th = Get-HostPort ([string]$owner.Target)
+            $sch = if ([string]$owner.Target -match '^https://') { 'https' } else { 'http' }
+            $r.Suggest = "${sch}://$($th.Host):$($th.Port)/mcp"
+        } else {
+            $r.Skip = '填的不是上游本体地址（应是 127.0.0.1 / localhost 这类本机地址）'
+        }
+        return $r
+    }
+
+    if ($match) {
+        $lh = [string]$match.ListenHost[0]
+        $lp = [string]$match.ListenPort[0]
+        if ($lh -in @('0.0.0.0', '::', '[::]')) {
+            $lan = Get-LanAddress
+            if ($lan) { $lh = $lan }
+        }
+        $r.Variant = "${lh}:${lp}"
+        $r.Note = "变体 Host 取自配置 [$($match.Name)] 的 listen 地址 $($match.ListenHost[0]):$lp"
+        $r.ProxyName = [string]$match.Name
+        $r.Current = $match.RewriteHost
+        return $r
+    }
+
+    $r.Variant = "xmcp-probe.example:$($hp.Port)"
+    $r.Note = "配置里没有与该上游对应的代理，变体 Host 用哨兵名 xmcp-probe.example:$($hp.Port)"
+    return $r
 }
 
 function Set-ProbeResult {
@@ -913,6 +1026,66 @@ function Render-ProbeResult {
     if ($server) { Add-Line ('服务端: ' + $server + ' ' + $serverVer) }
     Add-Line ''
 
+    # --- Host 校验：同一上游、同一报文，只把 Host 头换成外部地址再打一发 ---
+    Add-Line 'Host 校验（上游是否只认本机 Host）' $black
+    $hv = $script:probeHostInfo
+    if (-not $hv) { $hv = @{ Variant = ''; Note = ''; Skip = ''; Suggest = ''; ProxyName = ''; Current = $null } }
+    $baseHost = Get-HostPort $url
+    $baseText = $baseHost.Host + ':' + $baseHost.Port
+    $varHostText = $line['HOST_VARIANT']
+    if ($hv.Skip) {
+        Add-Line ('  [–] 跳过：' + $hv.Skip) $gray
+        if ($hv.Suggest) { Add-Line ('     应改填上游本体地址: ' + $hv.Suggest) $gray }
+        Add-Line ('     现在填的是: ' + $url) $gray
+    } elseif (-not $varHostText -or $line['VAR_HTTP'] -eq '–') {
+        Add-Line '  [–] 跳过：这次没有构造出外部 Host' $gray
+    } else {
+        $hostState = Get-HostVerdict $initCode $line['VAR_HTTP']
+        $baseOk = ($initCode -match '^2\d\d$')
+        $baseSym = if ($baseOk) { '✓' } elseif ($initCode -eq '000') { '?' } else { '✗' }
+        $baseColor = if ($baseOk) { $green } elseif ($initCode -eq '000') { $gray } else { $red }
+        Add-Line ('  [' + $baseSym + '] 基线  Host=' + $baseText + '    HTTP ' + $initCode) $baseColor
+        $varSym = switch ($hostState) { 'must' { '✗' } 'free' { '✓' } default { '?' } }
+        $varColor = switch ($hostState) { 'must' { $red } 'free' { $green } default { $gray } }
+        $varErr = Parse-ProbeBody $line['VAR_BODY']
+        $varTail = if ($varErr.ErrMsg) { ' · ' + $varErr.ErrMsg } elseif ($line['VAR_HTTP'] -notmatch '^2\d\d$' -and $line['VAR_BODY']) {
+            # 上游不一定按 JSON-RPC 返错，取响应体开头一段，别把原因吞掉
+            $s = ($line['VAR_BODY'] -replace '\s+', ' ')
+            if ($s.Length -gt 60) { $s = $s.Substring(0, 60) + '…' }
+            ' · ' + $s
+        } else { '' }
+        Add-Line ('  [' + $varSym + '] 变体  Host=' + $varHostText + '    HTTP ' + $line['VAR_HTTP'] + $varTail) $varColor
+        if ($hv.Note) { Add-Line ('     ' + $hv.Note) $gray }
+
+        # 判定 + 当前配置实况，一起说清"该不该开、现在开没开"
+        $cfgTail = ''
+        if ($hv.ProxyName -ne '') {
+            if ($hv.Current -eq $true) { $cfgTail = '配置里 [' + $hv.ProxyName + '] 的 rewrite_host 已是 true，当前行为正确' }
+            elseif ($hv.Current -eq $false) { $cfgTail = '配置里 [' + $hv.ProxyName + '] 的 rewrite_host 是 false，需要改成 true 再重启反代' }
+        }
+        switch ($hostState) {
+            'must' {
+                Add-Line ('  判定: 必须开启 rewrite_host —— 换成外部 Host 就被拒（HTTP ' + $line['VAR_HTTP'] + '），只有本机名能访问') $red
+            }
+            'free' {
+                Add-Line ('  判定: 不必开启 rewrite_host —— 外部 Host 也照常应答（HTTP ' + $line['VAR_HTTP'] + '），上游没做 Host 白名单') $green
+            }
+            default {
+                if ($initCode -eq '000') {
+                    Add-Line ('  判定: 无法判定 —— 基线根本没连上（HTTP 000），先把上游服务启动再说') $orange
+                } elseif (-not $baseOk) {
+                    Add-Line ('  判定: 无法判定 —— 基线（Host=' + $baseText + '）就是 HTTP ' + $initCode + '，Host 差异被遮住；先把基线的鉴权/路径问题修通再测') $orange
+                } elseif ($line['VAR_HTTP'] -match '^401$') {
+                    Add-Line '  判定: 无法判定 —— 变体回 401，像是被鉴权拦住而不是 Host 被拒，两件事叠在一起就分不清' $orange
+                } else {
+                    Add-Line ('  判定: 无法判定 —— 变体回了 HTTP ' + $line['VAR_HTTP'] + '，不是明确的 Host 拒绝，看不出上游是否校验 Host') $orange
+                }
+            }
+        }
+        if ($cfgTail) { Add-Line ('        ' + $cfgTail) $gray }
+    }
+    Add-Line ''
+
     # --- 结论 ---
     $concl = ''; $conclColor = $gray
     switch ($verdict) {
@@ -966,12 +1139,15 @@ function Start-Probe {
     if (-not $url) { Set-ProbeResult '请先填上游 MCP 地址。'; return }
     # 兼容裸 Key / "Bearer xxx" / "Authorization: Bearer xxx"，只保留裸令牌
     $token = ($script:txtProbeToken.Text.Trim() -ireplace '^\s*(Authorization\s*:\s*)?(Bearer\s+)?', '').Trim()
+    # Host 校验用的外部 Host 在 UI 线程算好（要读配置），后台脚本只负责发请求
+    $script:probeHostInfo = Get-ProbeHostVariant -Url $url
     $script:btnProbe.Enabled = $false
-    Set-ProbeResult '探测中…（initialize / discover / 会话通道，各最多等 5 秒）'
+    Set-ProbeResult '探测中…（initialize / discover / 会话通道 / Host 变体，各最多等 5 秒）'
     $ps = [PowerShell]::Create()
     [void]$ps.AddScript($script:probeTaskCode)
     [void]$ps.AddArgument($url)
     [void]$ps.AddArgument($token)
+    [void]$ps.AddArgument($script:probeHostInfo.Variant)
     $script:probePs = $ps
     $script:probeHandle = $ps.BeginInvoke()
     $script:probeTimer.Start()
@@ -2255,7 +2431,7 @@ $tabProbe.Padding = New-Object Windows.Forms.Padding(3)
 $script:tabProbe = $tabProbe
 
 $lblProbeHint = New-Object Windows.Forms.Label
-$lblProbeHint.Text = "填上游 MCP 地址（一般是 http(s)://127.0.0.1:端口/mcp），点「开始探测」：探针分别按旧规范发 initialize、按新规范发 server/discover，看上游认哪一套。上游要登录时在下方令牌框填 API Key，探针只发 Authorization: Bearer 头，内容打码、不写日志。"
+$lblProbeHint.Text = "地址必须填「上游本体地址」——服务自己监听的那个地址，形如 http(s)://127.0.0.1:端口/mcp。不要填反代对你的监听地址（192.168.x.x:端口）：那是门面，Host 已被反代改写，探针在这儿测不出真实情况，Host 校验只能跳过。`r`n点「开始探测」：按旧规范发 initialize、按新规范发 server/discover，再发一发只换 Host 头的变体，判断这条链路是否必须开 rewrite_host。上游要登录就在令牌框填 API Key，只发 Authorization: Bearer，内容打码、不写日志。"
 $lblProbeHint.AutoSize = $false
 $lblProbeHint.TextAlign = [Drawing.ContentAlignment]::TopLeft
 $panelProbeHint = New-HintPanel $lblProbeHint 64
@@ -2263,7 +2439,7 @@ $tabProbe.Controls.Add($panelProbeHint)
 $script:panelProbeHint = $panelProbeHint
 
 $lblProbeUrl = New-Object Windows.Forms.Label
-$lblProbeUrl.Text = '上游地址:'
+$lblProbeUrl.Text = '上游本体地址:'
 $tabProbe.Controls.Add($lblProbeUrl)
 $script:lblProbeUrl = $lblProbeUrl
 
@@ -2378,10 +2554,12 @@ XMCP 局域网反代工具 · 使用说明
      "rewrite_host": false, "upstream_timeout": 60
    点「重启代理」——先校验格式，通过才写盘（旧文件备份 .bak）并重启；
    随后在状态页 [监听] 确认新端口已 LISTENING，[连通性] 显示「连通」。
-4. 「MCP探针」页：填上游地址点「开始探测」。探针分别按旧规范 initialize、
-   新规范 server/discover 各打一发，有会话号再探通知流与会话删除，输出兼容性报告：
-   两条协议腿是否支持、会话能力（会话号 / GET 流 / DELETE 会话）、服务端能力
-   （Tools / Resources / Prompts），结论分双协议 / 仅旧 / 仅新 / 需要令牌 / 连不上。
+4. 「MCP探针」页：地址必须填「上游本体地址」（服务自己监听的那个，如 127.0.0.1:端口/mcp；
+   别填反代对你的监听地址，Host 已被改写，测不出真实情况）。点「开始探测」后，
+   探针按旧规范 initialize、新规范 server/discover 各打一发，有会话号再探通知流与会话删除，
+   最后再打一发只换 Host 头的变体，输出报告：两条协议腿是否支持、会话能力（会话号 /
+   GET 流 / DELETE 会话）、服务端能力（Tools / Resources / Prompts）、这条链路是否必须开
+   rewrite_host，结论分双协议 / 仅旧 / 仅新 / 需要令牌 / 连不上 / Host 必须改写。
 
 六、几个容易踩的点
 · rewrite_host 只在服务端校验 Host 时才设 true（XTerminal 必须 true，否则 403）；
@@ -2737,20 +2915,22 @@ function Update-Layout {
         $btnLogOpen.Location = New-Object Drawing.Point(108, ($ph - 32))
         $btnLogOpenUi.Location = New-Object Drawing.Point(274, ($ph - 32))
         # MCP 探针页（说明框 + 地址一行 + 令牌/按钮一行 + 结果框）
+        # 说明框要放下"必须填上游本体地址"那段，比其它页高一档；下面控件整体下移
         $script:panelProbeHint.Location = New-Object Drawing.Point(6, 4)
-        $script:panelProbeHint.Size = New-Object Drawing.Size(($pw - 12), 64)
-        $script:lblProbeUrl.Location = New-Object Drawing.Point(6, 78)
-        $script:lblProbeUrl.Size = New-Object Drawing.Size(64, 22)
-        $script:txtProbeUrl.Location = New-Object Drawing.Point(74, 76)
-        $script:txtProbeUrl.Size = New-Object Drawing.Size(($pw - 80), 22)
-        $script:lblProbeToken.Location = New-Object Drawing.Point(6, 106)
+        $script:panelProbeHint.Size = New-Object Drawing.Size(($pw - 12), 126)
+        $script:lblProbeUrl.Location = New-Object Drawing.Point(6, 140)
+        $script:lblProbeUrl.Size = New-Object Drawing.Size(96, 22)
+        $script:txtProbeUrl.Location = New-Object Drawing.Point(106, 138)
+        $script:txtProbeUrl.Size = New-Object Drawing.Size(($pw - 112), 22)
+        $script:lblProbeToken.Location = New-Object Drawing.Point(6, 168)
         $script:lblProbeToken.Size = New-Object Drawing.Size(100, 22)
-        $btnProbe.Location = New-Object Drawing.Point(($pw - 6 - 96), 102)
+        $btnProbe.Location = New-Object Drawing.Point(($pw - 6 - 96), 164)
         $btnProbe.Size = New-Object Drawing.Size(96, 26)
-        $script:txtProbeToken.Location = New-Object Drawing.Point(106, 104)
+        $script:txtProbeToken.Location = New-Object Drawing.Point(106, 166)
         $script:txtProbeToken.Size = New-Object Drawing.Size(($pw - 216), 22)
-        $script:txtProbeResult.Location = New-Object Drawing.Point(6, 134)
-        $script:txtProbeResult.Size = New-Object Drawing.Size(($pw - 12), ($ph - 134))
+        $script:txtProbeResult.Location = New-Object Drawing.Point(6, 196)
+        $script:txtProbeResult.Size = New-Object Drawing.Size(($pw - 12), ($ph - 196))
+        Set-TextInnerPad $script:txtProbeResult
         Set-TextInnerPad $script:txtProbeResult
         # 使用说明页 / 关于软件页：整页一个带边框的阅读框
         $script:panelHelp.Location = New-Object Drawing.Point(6, 6)
