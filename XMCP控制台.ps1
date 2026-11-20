@@ -2575,7 +2575,7 @@ $tabLog.Padding = New-Object Windows.Forms.Padding(3)
 $script:tabLog = $tabLog
 
 $lblLog = New-Object Windows.Forms.Label
-$lblLog.Text = "最新在最上：下面两个二级 tab 分别看「控制台日志」和「反代日志」，各取最近 60 条。`r`n切到本页或点「刷新」会重新读取；要全文就用底部的记事本按钮。"
+$lblLog.Text = "下面四个二级 tab：「控制台日志」「反代日志」「链路日志」各取最近 60 条（最新在最上），「日志详解」是字段与原因口径说明。`r`n切到本页或点「刷新」会重新读取；要全文就用底部的记事本按钮。"
 $lblLog.AutoSize = $false
 $lblLog.TextAlign = [Drawing.ContentAlignment]::TopLeft
 
@@ -2608,7 +2608,7 @@ $btnLogOpenTrace.Location = New-Object Drawing.Point(456, 330)
 $btnLogOpenTrace.Size = New-Object Drawing.Size(156, 26)
 $tabLog.Controls.Add($btnLogOpenTrace)
 
-# 二级 tab：控制台日志 / 反代日志 / 链路日志，各占一个只读文本框
+# 二级 tab：控制台日志 / 反代日志 / 链路日志 / 日志详解，各占一个只读文本框
 $logTabs = New-Object Windows.Forms.TabControl
 $logTabs.Location = New-Object Drawing.Point(6, 38)
 $logTabs.Size = New-Object Drawing.Size(620, 286)
@@ -2686,6 +2686,93 @@ $txtLogTrace.BackColor = [Drawing.Color]::White
 $txtLogTrace.Dock = [Windows.Forms.DockStyle]::Fill
 $logPageTrace.Controls.Add($txtLogTrace)
 $script:txtLogTrace = $txtLogTrace
+
+$logPageGuide = New-Object Windows.Forms.TabPage
+$logPageGuide.Text = '日志详解'
+$logPageGuide.Padding = New-Object Windows.Forms.Padding(4)
+[void]$logTabs.TabPages.Add($logPageGuide)
+
+$txtLogGuide = New-Object Windows.Forms.TextBox
+$txtLogGuide.Multiline = $true
+$txtLogGuide.ReadOnly = $true
+$txtLogGuide.ScrollBars = [Windows.Forms.ScrollBars]::Vertical
+$txtLogGuide.WordWrap = $true
+$txtLogGuide.Font = New-Object Drawing.Font('Microsoft YaHei UI', 9)
+$txtLogGuide.BackColor = [Drawing.Color]::White
+$txtLogGuide.Dock = [Windows.Forms.DockStyle]::Fill
+$guideText = @'
+链路日志 · 口径详解（mcp-relay-trace.log）
+每条记录以 trace= 后的 12 位编号贯穿单次请求的接入、上游、交付、结束全过程；同一 trace_id 的多条记录属于同一次请求。
+
+一、三类事件
+CONNECT  客户端接入
+  proxy        代理名（配置里的 name）
+  client       客户端地址
+  method       HTTP 方法（GET / POST / DELETE 等）
+  path         请求路径
+  ctype        请求 Content-Type
+  accept       请求 Accept 头
+  proto        MCP-Protocol-Version 协议版本头（没有则省略）
+  session      是否携带会话号（yes / no，不记会话号真值）
+  auth         是否携带鉴权（present / missing，不记 Token 真值）
+  req_bytes    请求体字节数
+
+UPSTREAM 上游链路
+  upstream        上游地址（host:port）
+  connect_status  建连状态（ok 表示已连上上游）
+  status          上游响应状态码
+  ctype           响应 Content-Type
+  te              Transfer-Encoding（没有则记 -）
+  cl              Content-Length（没有则记 -）
+  up_connect_ms   建连耗时（毫秒）
+
+END 下游交付与结束
+  reason          结束原因（见下表）
+  up_bytes        从上游收到的字节数
+  down_bytes      写入下游的字节数（写入层接受量，不等于客户端已确认读取）
+  dur_ms          本次链路总时长（毫秒）
+  first_up_ms     距启动到首个上游字节
+  first_down_ms   距启动到首个下游写入
+  first_event_ms  距启动到首个完整 SSE 事件（无事件记 -）
+  last_active_ms  最后一次活动距启动
+  backpressure    背压状态（当前阻塞写无显式信号，记 n/a）
+  idle            是否静默长流（yes = 流保持但尚无完整业务事件）
+
+二、结束原因（reason）对照表
+NORMAL_CLOSE          正常关闭，请求与响应完整走完。
+CLIENT_DISCONNECTED   客户端主动断开：对端关闭连接、超时取消或中断。
+UPSTREAM_DISCONNECTED 上游连不上或中途断开：端口没开、拒绝连接、无响应后断开。
+RESPONSE_TIMEOUT      上游响应超时：建连或读响应等到超时。
+IDLE_TIMEOUT          长流静默等到超时；属空闲，不是业务错误。
+DOWNSTREAM_WRITE_ERROR 向下游写数据失败（断连/重置之外的写异常）。
+CONNECT_TIMEOUT       预留：TCP 建连超时（当前与响应超时合并记 RESPONSE_TIMEOUT）。
+STREAM_PARSE_ERROR    预留：流解析错误（纯透传不解析报文，当前不产生）。
+UNKNOWN_ERROR         未归类异常，需结合「反代日志」页的具体报错排查。
+
+三、SSE 长流怎么读
+- 200 + text/event-stream 只代表流已建立，不等于已经收到首帧。
+- first_event_ms=- 且 idle=yes：连接保持但还没有完整业务事件，是静默，不要当成错误。
+- 完整事件按字节流里的空行（空行分隔）判定；HTTP chunk 边界不算事件边界。
+- up_bytes 与 down_bytes 应一致；对不上说明中途有断开或写失败。
+- 心跳注释帧（: ping 一类）也会计入字节数。
+
+四、安全口径
+- 不记录 Authorization、Token、Cookie、Session ID 真实值，只记有无。
+- 默认不记录工具调用参数与响应正文。
+- 按 trace_id 可在 mcp-relay-trace.log 里追到单次请求的全部记录。
+
+五、常见场景速查
+- 401：auth=missing 或上游判定凭证无效；先核对连接器的鉴权头与 Token。
+- 502 / UPSTREAM_DISCONNECTED：上游没开、端口不对，或 HTTPS / HTTP 写反。
+- 长流挂起无数据：idle=yes 是静默；first_up_ms=- 表示上游首字节都没到。
+- 客户端掉了：reason=CLIENT_DISCONNECTED，多为连接器超时或主动取消。
+- 字节对不上：up_bytes ≠ down_bytes，按 reason 区分是上游断还是下游写失败。
+
+原始记录见「链路日志」页；详细报错堆栈见「反代日志」页。
+'@
+$txtLogGuide.Text = (To-Crlf $guideText)
+$logPageGuide.Controls.Add($txtLogGuide)
+$script:txtLogGuide = $txtLogGuide
 
 $tabLog.Controls.Add($logTabs)
 $script:logTabs = $logTabs
