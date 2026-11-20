@@ -2917,22 +2917,35 @@ function Update-Layout {
         $btnLogOpen.Location = New-Object Drawing.Point(108, ($ph - 32))
         $btnLogOpenUi.Location = New-Object Drawing.Point(274, ($ph - 32))
         # MCP 探针页（说明框 + 地址一行 + 令牌/按钮一行 + 结果框）
-        # 说明框要放下"必须填上游本体地址"那段，比其它页高一档；下面控件整体下移
+        # 说明框高度按文字实际排版算，不写死：窗口拉宽后文字行数变少，框也跟着变矮，
+        # 底下不留一片空白；下面的地址行/令牌行/结果框都相对框底往下排。
         $script:panelProbeHint.Location = New-Object Drawing.Point(6, 4)
-        $script:panelProbeHint.Size = New-Object Drawing.Size(($pw - 12), 126)
-        $script:lblProbeUrl.Location = New-Object Drawing.Point(6, 140)
+        $hintBoxW = ($pw - 12)
+        $hintTextW = $hintBoxW - 22          # 减掉边框 1×2 和内边距 10×2
+        $hintH = 64
+        try {
+            $hintFont = if ($script:lblProbeHint.Font) { $script:lblProbeHint.Font } else { New-Object Drawing.Font('Microsoft YaHei UI', 9) }
+            $hintMeas = [Windows.Forms.TextRenderer]::MeasureText(
+                $script:lblProbeHint.Text, $hintFont,
+                (New-Object Drawing.Size([Math]::Max(120, $hintTextW), 2000)),
+                [Windows.Forms.TextFormatFlags]::WordBreak)
+            $hintH = $hintMeas.Height + 14   # 上下内边距 5+5、边框 1+1，再留 2px 余量
+            if ($hintH -lt 44) { $hintH = 44 }
+        } catch { $hintH = 64 }
+        $yBase = 4 + $hintH                  # 说明框底边
+        $script:panelProbeHint.Size = New-Object Drawing.Size($hintBoxW, $hintH)
+        $script:lblProbeUrl.Location = New-Object Drawing.Point(6, ($yBase + 10))
         $script:lblProbeUrl.Size = New-Object Drawing.Size(96, 22)
-        $script:txtProbeUrl.Location = New-Object Drawing.Point(106, 138)
+        $script:txtProbeUrl.Location = New-Object Drawing.Point(106, ($yBase + 8))
         $script:txtProbeUrl.Size = New-Object Drawing.Size(($pw - 112), 22)
-        $script:lblProbeToken.Location = New-Object Drawing.Point(6, 168)
+        $script:lblProbeToken.Location = New-Object Drawing.Point(6, ($yBase + 38))
         $script:lblProbeToken.Size = New-Object Drawing.Size(100, 22)
-        $btnProbe.Location = New-Object Drawing.Point(($pw - 6 - 96), 164)
+        $btnProbe.Location = New-Object Drawing.Point(($pw - 6 - 96), ($yBase + 34))
         $btnProbe.Size = New-Object Drawing.Size(96, 26)
-        $script:txtProbeToken.Location = New-Object Drawing.Point(106, 166)
+        $script:txtProbeToken.Location = New-Object Drawing.Point(106, ($yBase + 36))
         $script:txtProbeToken.Size = New-Object Drawing.Size(($pw - 216), 22)
-        $script:txtProbeResult.Location = New-Object Drawing.Point(6, 196)
-        $script:txtProbeResult.Size = New-Object Drawing.Size(($pw - 12), ($ph - 196))
-        Set-TextInnerPad $script:txtProbeResult
+        $script:txtProbeResult.Location = New-Object Drawing.Point(6, ($yBase + 66))
+        $script:txtProbeResult.Size = New-Object Drawing.Size(($pw - 12), ($ph - $yBase - 66))
         Set-TextInnerPad $script:txtProbeResult
         # 使用说明页 / 关于软件页：整页一个带边框的阅读框
         $script:panelHelp.Location = New-Object Drawing.Point(6, 6)
