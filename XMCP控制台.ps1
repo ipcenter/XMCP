@@ -2702,7 +2702,7 @@ $txtLogGuide.BackColor = [Drawing.Color]::White
 $txtLogGuide.Dock = [Windows.Forms.DockStyle]::Fill
 $guideText = @'
 链路日志 · 口径详解（mcp-relay-trace.log）
-每条记录以 trace= 后的 12 位编号贯穿单次请求的接入、上游、交付、结束全过程；同一 trace_id 的多条记录属于同一次请求。
+每条记录以 trace= 后的 12 位编号贯穿单次请求的接入、上游、交付、结束全过程；同一 trace_id 的多条记录属于同一次请求。每组请求以一条等号分隔线开头，把 CONNECT / UPSTREAM / END 框成一组。
 
 一、三类事件
 CONNECT  客户端接入

@@ -189,6 +189,7 @@ def log(msg):
 # ---- 链路诊断日志（独立文件，只记可观测性信息，不记凭证与报文正文）----
 _TRACE_PATH = os.path.join(SCRIPT_DIR, "mcp-relay-trace.log")
 _TRACE_MAX_BYTES = 5 * 1024 * 1024
+_TRACE_SEP = "=" * 60
 
 # 结束原因枚举：区分客户端断开 / 上游断开 / 超时 / 下游写失败 / 正常关闭等
 REASON_CLIENT_DISCONNECTED = "CLIENT_DISCONNECTED"
@@ -455,6 +456,8 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                 declared_length = 0
 
         # 接入日志：只记头与有无凭证，不记 Token / Session 真值 / 报文正文
+        # 每组请求开头一条分隔线，把同一次请求的 CONNECT/UPSTREAM/END 框成一组
+        _trace_write(_TRACE_SEP + "\n")
         tr.event("CONNECT", proxy=cfg["name"], client=self.client_address[0],
                  method=method, path=path, ctype=tr.content_type, accept=tr.accept,
                  proto=tr.protocol_version, session=tr.has_session, auth=tr.auth,
