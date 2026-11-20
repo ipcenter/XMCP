@@ -313,6 +313,8 @@ function Get-ConnDiag {
 function Get-StatusText {
 
     $sb = New-Object System.Text.StringBuilder
+    # 段与段之间统一用一条横线隔开（比空行更容易看出"这是另一类信息"）
+    $sep = ('-' * 66)
     [void]$sb.AppendLine('=== XMCP 反代工具 ===')
     [void]$sb.AppendLine('检测时间: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
     [void]$sb.AppendLine('')
@@ -320,7 +322,7 @@ function Get-StatusText {
     $cfg = Get-RelayConfig -Root $root
     [void]$sb.AppendLine('[配置] ' + $cfg.Path)
     if ($cfg.Error) { [void]$sb.AppendLine('  !! 配置错误: ' + $cfg.Error) }
-    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine($sep)
 
     [void]$sb.AppendLine('[代理]')
     $firstAddr = ''
@@ -371,7 +373,7 @@ function Get-StatusText {
         $arrowX = $indentW + $addrW + 16         # 箭头列
         $firstBlock = $true
         foreach ($b in $pBlocks) {
-            if (-not $firstBlock) { [void]$sb.AppendLine('') }   # 代理之间空一行，眼睛容易分组
+            if (-not $firstBlock) { [void]$sb.AppendLine($sep) }   # 代理之间用横线分组
             $firstBlock = $false
             $line = $b.Name
             if ($b.Tag) { $line = $line + '  ' + $b.Tag }
@@ -385,14 +387,14 @@ function Get-StatusText {
 
     $proc = Get-RelayProcess
 
-    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine($sep)
     if ($proc) {
         [void]$sb.AppendLine('[进程] 运行中   PID ' + $proc.Id + '   ' + $proc.ProcessName + '   启动于 ' + $proc.StartTime.ToString('HH:mm:ss'))
     } else {
         [void]$sb.AppendLine('[进程] 未运行   （下面若全部不通，先看这里）')
     }
 
-    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine($sep)
     [void]$sb.AppendLine('[监听]')
     # 用正则解析完整 netstat 文本（netstat | Select-String 在本机偶发只回一行，会少显示监听）
     $nsText = ''
@@ -414,7 +416,7 @@ function Get-StatusText {
         }
     }
 
-    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine($sep)
     [void]$sb.AppendLine('[连通性] 自动检测')
     $ok = 0
     $bad = 0
@@ -449,7 +451,7 @@ function Get-StatusText {
     # 健康判定：进程在 且 所有配置地址都真正通达（5xx 不算通达，上游其实已经挂了）
     $script:healthy = [bool]($proc -ne $null -and $total -gt 0 -and $ok -eq $total)
 
-    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine($sep)
     $stateFile = Join-Path $root 'firewall-state.txt'
     if (Test-Path -LiteralPath $stateFile) {
         $sl = @(Get-Content -LiteralPath $stateFile -Encoding utf8)
