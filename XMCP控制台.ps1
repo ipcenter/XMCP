@@ -662,6 +662,12 @@ param($Url, $Token, $HostVariant)
 $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
 if (-not (Test-Path -LiteralPath $curl)) { $curl = 'curl.exe' }
 
+# 后台进程控制台可能是 GBK(936)：原生程序（curl）的回包会被按 ANSI 解码，
+# 含中文的 JSON 会被破坏。先把输入输出编码固定成 UTF-8（无 BOM；回包另走文件字节流兜底）。
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
+
 # 兼容三种粘贴：裸 Key / "Bearer xxx" / "Authorization: Bearer xxx"，只保留裸令牌
 $tok = ($Token -ireplace '^\s*(Authorization\s*:\s*)?(Bearer\s+)?', '').Trim()
 
@@ -678,12 +684,20 @@ function Invoke-McpPost {
     if ($EnvelopeMeta) { $bodyParams = ($Params + @{ _meta = $EnvelopeMeta }) }
     $bodyObj = [ordered]@{ jsonrpc = '2.0'; id = 1; method = $Method; params = $bodyParams }
     $body = ($bodyObj | ConvertTo-Json -Compress -Depth 6)
-    # -i 带回响应头；-k 忽略自签证书；--noproxy 不走系统代理；--max-time 5 防止卡死 UI 等待。
-    # 请求体走 stdin（--data-binary @-）：PS 5.1 把含双引号的 JSON 作为原生程序参数传递时会转义错乱，
-    # 上游解析不了报文直接回 40015；走 stdin 可绕开参数引号问题。
-    $curlArgs = @('-sS','-k','-i','--noproxy','*','--max-time','5','-X','POST',$Url) + $headers + @('--data-binary','@-')
-    $raw = ($body | & $curl @curlArgs 2>&1 | Out-String)
-    return $raw
+    # 请求体/响应头/体分别落盘再按 UTF-8 读回：绕开控制台 ANSI 解码，也避免 stdin 编码带入 BOM。
+    $tmpReq = [IO.Path]::GetTempFileName()
+    $tmpHead = [IO.Path]::GetTempFileName()
+    $tmpBody = [IO.Path]::GetTempFileName()
+    try {
+        [IO.File]::WriteAllText($tmpReq, $body, $utf8NoBom)
+        $curlArgs = @('-sS','-k','--noproxy','*','--max-time','5','-X','POST',$Url,'-D',$tmpHead,'-o',$tmpBody) + $headers + @('--data-binary', ('@' + $tmpReq))
+        [void](& $curl @curlArgs 2>&1 | Out-Null)
+        $head = [IO.File]::ReadAllText($tmpHead, [Text.Encoding]::UTF8)
+        $respBody = [IO.File]::ReadAllText($tmpBody, [Text.Encoding]::UTF8)
+        return ($head.TrimEnd() + "`r`n`r`n" + $respBody)
+    } finally {
+        Remove-Item $tmpReq, $tmpHead, $tmpBody -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-McpRequest {
@@ -691,8 +705,16 @@ function Invoke-McpRequest {
     $headers = @('-H', 'Accept: text/event-stream, application/json')
     if ($Tok) { $headers += @('-H', ('Authorization: Bearer ' + $Tok)) }
     if ($Session) { $headers += @('-H', ('Mcp-Session-Id: ' + $Session)) }
-    $raw = & $curl -sS -k -i --noproxy '*' --max-time $MaxTime -X $HttpMethod $Url @headers 2>&1 | Out-String
-    return $raw
+    $tmpHead = [IO.Path]::GetTempFileName()
+    $tmpBody = [IO.Path]::GetTempFileName()
+    try {
+        [void](& $curl -sS -k --noproxy '*' --max-time $MaxTime -X $HttpMethod $Url -D $tmpHead -o $tmpBody @headers 2>&1 | Out-Null)
+        $head = [IO.File]::ReadAllText($tmpHead, [Text.Encoding]::UTF8)
+        $respBody = [IO.File]::ReadAllText($tmpBody, [Text.Encoding]::UTF8)
+        return ($head.TrimEnd() + "`r`n`r`n" + $respBody)
+    } finally {
+        Remove-Item $tmpHead, $tmpBody -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Split-Response {
@@ -1145,6 +1167,7 @@ function Render-ProbeResult {
     $prom  = $init.Prompts -or $disc.Prompts
     $capState = { param($b) if ($b) { 'yes' } else { 'no' } }
     Add-Line ('  [' + (State-Symbol (& $capState $tools)) + '] 工具（Tools）   [' + (State-Symbol (& $capState $res)) + '] 资源（Resources）   [' + (State-Symbol (& $capState $prom)) + '] 提示（Prompts）') $black
+    Add-Line '  注: ✓ 仅表示初始化响应里声明了该能力，未逐条实际调用 tools/list 等验证。' $gray
     Add-Line ''
 
     # --- Host 校验：同一上游、同一报文，只把 Host 头换成外部地址再打一发 ---
@@ -1191,6 +1214,7 @@ function Render-ProbeResult {
             'free' {
                 Add-Line '  判定: 不必开启 rewrite_host' $green
                 Add-Line ('        外部 Host 也照常应答（HTTP ' + $line['VAR_HTTP'] + '），上游没做 Host 白名单') $green
+                Add-Line '        改 Host 头不等于另一台机器访问，不能据此判断局域网可达。' $gray
             }
             default {
                 if ($initCode -eq '000') {
@@ -1264,7 +1288,8 @@ function Render-ProbeResult {
     Add-Line '  · 会话号（Mcp-Session-Id）：服务端在响应头给出的会话标识，' $black
     Add-Line '    后续请求靠它续上；不发会话号的实现只能用无状态方式。' $black
     Add-Line '  · 通知流（GET 长连接）：服务端主动往下推事件的通道；' $black
-    Add-Line '    不提供也不影响调用，工具照样能一条条 POST 调。' $black
+    Add-Line '    不提供也不影响调用，工具照样能一条条 POST 调。HTTP 200 只说明端点应答，' $black
+    Add-Line '    未校验连接保持与事件推送。' $black
     Add-Line '  · 关闭会话（DELETE）：客户端显式告诉服务端"这个会话结束了"。' $black
     Add-Line '  · capabilities：服务端声明的能力清单，下面三项就来自这里。' $black
     Add-Line '  · 工具（Tools）：可被调用的动作，最常用；资源（Resources）：可读取的数据；' $black
